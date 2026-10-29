@@ -26,7 +26,7 @@
 
 ---
 
-## 二、本地方案（已落地，实测峰值 322MB / 8.4s）
+## 二、本地方案（已落地，实测峰值 ~340MB / 9.5 CPU 秒）
 
 ### 2.1 核心洞察：det 与 rec 的内存维度不同
 
@@ -232,9 +232,9 @@ GET  /tasks/{task_id}  → {status, stage, progress, error_message, has_pdf}
 备选：腾讯云 OCR / 百度 OCR（国内网络更稳，但**没有「密集文本 + 逐词包围盒」这一档**，
 需要自己拼；Vision 的 `fullTextAnnotation` 开箱即用，与本地 `_ocr_items` 的框结构几乎一一对应）。
 
-**什么时候才需要切云端**：本地峰值已压到 322MB 且 8.4s 完成，**当前不需要切**。
-但 `OCR_PROVIDER=cloud` 已完整实现并保留，作为「用户传了超大图 / 手写谱 / 机器规格再降 / 免费额度
-用尽」时的兜底路径——切过去只需改一个环境变量，**不改前端、不改接口**。
+**什么时候才需要切云端**：见 4.4 —— 本地已优化到 9.5 CPU 秒（线上约 32s），
+60s 硬指标可达，**云端作为兜底保留**：用户传超大图 / 手写谱 / 机器规格再降 /
+免费额度用尽时，切过去只需改一个环境变量，**不改前端、不改接口**。
 
 ### 4.2 为什么外包不需要改前端
 
@@ -247,7 +247,68 @@ GET  /tasks/{task_id}  → {status, stage, progress, error_message, has_pdf}
 上层 `extract/omr.py` 的落格 / 符杠 / 排版逻辑**一行都没改**，
 它只认 `OcrItem`，不关心是谁识别的。云端结果经过 `_parse_google()` 映射成同样的结构即可。
 
-### 4.3 伪代码
+### 4.3 本地优化的最终结论（为什么现在能进 60s）
+
+线上验收第一轮（ORT 默认线程）功能全通过但**墙钟 150s**：
+
+| 验收项 | 结果 |
+|---|---|
+| 24 小节 / 311 音符 | ✅ |
+| PDF 生成 | ✅ |
+| 连续两个任务都成功、结果一致 | ✅ |
+| 无 OOM | ✅ |
+| 墙钟 | ❌ 150s（目标 60s） |
+
+排查发现**根因不是算力总量，而是 onnxruntime 的线程配置**：
+
+`rapidocr-onnxruntime` 1.2.3 建 `SessionOptions` 时**没有设**
+`intra_op_num_threads`，onnxruntime 于是开满**物理核数**，每个算子内部
+用自旋（spin-wait）等待线程同步。在 16 核本机上这几乎免费，
+在 Render Free 的 **0.1 CPU** 上就是灾难 —— 线程大部分时间在自旋烧 CPU。
+
+实测（同一张谱，CPU 秒 = user + sys）：
+
+| intra_op 线程数 | 合计 CPU 秒 |
+|---|---|
+| **1** | **10.7** ← 定案 |
+| 2 | 15.5 |
+| 4 | 26.6 |
+| 8 | 50.4 |
+| 16（默认） | 50.7 |
+
+完整流程端到端：**44.1 CPU 秒 → 9.5 CPU 秒（-78%）**，谱面结果
+**完全一致**（311 音符 / 24 小节）。
+
+> 换算关系：线上 0.1 CPU，墙钟 ≈ CPU 秒 × 10。
+> 44.1 CPU 秒 → 150s（实测吻合），9.5 CPU 秒 → 约 32s。
+
+实现：`extract/ort_tune.py`（注入线程限制 + OMP 环境变量），
+在 `ocr_raster._load_engine` / `ocr_provider._get_engine` 建 session 前调用；
+worker 子进程在 **spawn 时**把 `OMP_NUM_THREADS` 注入环境
+（ORT 读的是环境变量，运行时改 `os.environ` 已经太晚）。
+
+> 附带发现：`sess_opt.enable_cpu_mem_arena = False` —— rapidocr 本来就关了
+> arena，所以**不存在 arena 跨任务累积**，子进程隔离只是为了「OOM 不拖垮主进程」。
+
+### 4.4 云端 provider 的离线验收结果
+
+用 mock 拦截 `urlopen`（不起外网、不消耗额度）验证：
+
+| 验收项 | 结果 |
+|---|---|
+| 请求体格式（`requests[0].image.content` + `features.DOCUMENT_TEXT_DETECTION`） | ✅ |
+| 图片 base64 编码 + `X-API-Key` 头 | ✅ |
+| 归一化坐标 → 像素坐标换算 | ✅ 精确还原 |
+| 401 → `auth` | ✅ |
+| 429 → `quota` | ✅ |
+| 5xx → `unavailable` | ✅ |
+| 坏 JSON → `bad_response` | ✅ |
+| 超时 → `timeout` | ✅ |
+| 连接失败 → `unavailable` | ✅ |
+| 429 自动重试（retries=1 → 实际 2 次） | ✅ |
+| **云端 vs 本地 OcrItem 结构一致**（`text/x0/x1/yc/h`） | ✅ 前端零改动 |
+
+### 4.5 伪代码
 
 #### (1) 接口封装 —— `CloudOcrProvider._post()`
 
@@ -407,19 +468,28 @@ envVars:
 
 ```yaml
 - key: OCR_RUN_MODE
-  value: subproc         # 子进程隔离，arena 不累积
+  value: subproc         # 子进程隔离，OOM 不拖垮主进程
 - key: OCR_TILES
   value: "4"
+- key: OCR_TILE_OVERLAP
+  value: "120"
+- key: OCR_BLOCK_H
+  value: "600"
 - key: OCR_REC_SCALE
   value: "1.0"
+- key: OCR_NORM_WIDTH
+  value: "1080"          # 所有输入统一归一化 → 结果与输入尺寸无关
+- key: OCR_ORT_THREADS
+  value: "1"             # onnxruntime 单线程：44.1 CPU 秒 → 9.5 CPU 秒（关键！）
 - key: OCR_PROVIDER
-  value: local
+  value: local           # 配了 CLOUD_OCR_ENDPOINT 会自动切云端
 - key: LOG_LEVEL
   value: INFO
 ```
 
 代码默认值同样锁死为这组（`extract/ocr_raster.py`）：
-`OCR_TILES=4`、`OCR_TILE_OVERLAP=120`、`OCR_REC_SCALE=1.0`、`OCR_MIN_SCORE=0.5`。
+`OCR_TILES=4`、`OCR_TILE_OVERLAP=120`、`OCR_BLOCK_H=600`、`OCR_REC_SCALE=1.0`、
+`OCR_MIN_SCORE=0.5`、`OCR_DET_WIDTH=0`（det 不缩图，缩了就掉召回）。
 
 ---
 
@@ -427,11 +497,13 @@ envVars:
 
 | 文件 | 改动 |
 |---|---|
-| `extract/ocr_raster.py` | **新增**：分块 det + 裁剪 rec 通道，原图坐标系输出 OcrItem，含 `_dedup` 与 timing 回传 |
-| `extract/beams.py` | **新增**：独立横线连通域检测 + `count_beams` 归属判定 |
+| `extract/ocr_raster.py` | **新增**：分块 det + 裁剪 rec 通道，原图坐标系输出 OcrItem，含 `_dedup` 与 timing 回传；`_EngineAdapter` 兼容 rapidocr 两代 API |
+| `extract/beams.py` | **新增**：独立横线连通域检测 + `count_beams` 归属判定；分带处理避免 int32 标签图占满内存 |
 | `extract/ocr_provider.py` | **新增**：provider 适配层（local / cloud / auto）+ `OcrProviderError` 错误码契约 |
-| `extract/ocr_worker.py` | **新增**：子进程 OCR worker，进程退出即释放全部内存 |
-| `extract/omr.py` | 接入新 provider + 独立符杠；**原有落格/排版业务逻辑一字未改** |
+| `extract/ocr_worker.py` | **新增**：子进程 OCR worker，进程退出即释放全部内存；spawn 时注入 OMP 线程数 |
+| `extract/ort_tune.py` | **新增**：onnxruntime 线程数限制（`intra_op=1`）—— 0.1 CPU 上的决定性优化 |
+| `extract/omr.py` | 接入新 provider + 独立符杠 + 输入归一化；**原有落格/排版业务逻辑一字未改** |
 | `pipeline.py` | 接入 `_Timing` 分段计时 + 性能日志 + OCR 并发闸 |
 | `main.py` | 新增 `POST /tasks`(202) / `GET /tasks/{task_id}`；`/upload` 追加 `task_id`；补 `logging.basicConfig` |
-| `render.yaml` | plan 改 free；补 OCR 性能参数 |
+| `requirements.txt` | 锁 `rapidocr-onnxruntime==1.2.3`（1.4.x 改了 API 入口名） |
+| `render.yaml` | plan 改 free；前端改纯静态；补全部 OCR 性能参数 |
