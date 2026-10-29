@@ -1,0 +1,17 @@
+name: Keep Alive (prevent Render free tier spin-down)
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 每 10 分钟
+  workflow_dispatch: {}       # 也支持手动触发
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend healthz
+        run: |
+          echo "Pinging handpan-backend to keep it awake..."
+          curl -sS --max-time 60 https://handpan-backend.onrender.com/healthz
+          echo ""
+          echo "Done."
