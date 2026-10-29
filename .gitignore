@@ -1,0 +1,15 @@
+# 本地环境
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行时数据（上传件、PDF、本地 SQLite）—— 绝不入库
+data/
+
+# 密钥
+.env
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+services:
+  # ─────────────────────────────── 后端
+  - type: web
+    name: handpan-backend
+    runtime: python
+    plan: starter              # 免费 512MB 跑不动 OCR（onnxruntime + 模型），必须 starter
+    repo: https://github.com/12zfd/handpan-backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    disk:
+      name: handpan-data       # Render 的容器盘是临时的，必须挂持久盘
+      mountPath: /var/data
+      sizeGB: 1                # 约 $0.25/月
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: handpan-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true    # 自动生成随机值，别用默认的 dev 值
+      - key: DATA_DIR
+        value: /var/data
+      - key: TRANSCRIBE_ENGINE
+        value: handpan
+      - key: OMR_ENGINE
+        value: tab
+      - key: CORS_ORIGINS
+        sync: false            # 填前端域名，如 https://handpan-frontend.onrender.com
+
+  # ─────────────────────────────── 前端
+  - type: web
+    name: handpan-frontend
+    runtime: static
+    repo: https://github.com/12zfd/handpan-frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false            # 填后端域名，如 https://handpan-backend.onrender.com
+
+databases:
+  - name: handpan-db
+    plan: free
