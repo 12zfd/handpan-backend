@@ -428,6 +428,18 @@ def healthz():
     return {"ok": True, "ts": int(time.time())}
 
 
+@app.get("/")
+def root():
+    """根路径：浏览器直接打开后端地址时给出友好提示，而不是 404。"""
+    return {
+        "service": "handpan-backend",
+        "status": "running",
+        "hint": "这是 API 服务，请使用前端页面 https://handpan-frontend.onrender.com",
+        "docs": "/docs",
+        "health": "/healthz",
+    }
+
+
 # ------------------------------------------------------------------ 前端静态托管
 # 本地/单服务部署时，把 vite build 产物挂在根路径；Render 三服务部署时该目录不存在，自动跳过。
 DIST = BASE_DIR.parent / "handpan-frontend" / "dist"
