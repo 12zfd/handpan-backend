@@ -40,6 +40,9 @@ services:
         value: "1.0"           # 识别用原图裁剪（峰值更低，结果与 2x 一致）
       - key: OCR_NORM_WIDTH
         value: "1080"          # 所有输入统一归一化到 1080 宽 → 结果与输入尺寸无关
+      - key: OCR_ORT_THREADS
+        value: "1"             # onnxruntime 单线程：默认开满物理核会让 80% 的 CPU
+                               # 烧在自旋等待上（实测 44.1 CPU 秒 → 9.5 CPU 秒）
       - key: OCR_PROVIDER
         value: local           # 配了 CLOUD_OCR_ENDPOINT 会自动切云端 OCR
       - key: LOG_LEVEL

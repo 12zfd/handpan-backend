@@ -59,6 +59,18 @@ REC_SCALE = _env_float("OCR_REC_SCALE", 1.0)
 MIN_SCORE = _env_float("OCR_MIN_SCORE", 0.5)
 # 目标块高（像素）。块高 ≈ 600 时 det 的等效放大倍数一致 → 结果最稳。
 TARGET_BLOCK_H = _env_int("OCR_BLOCK_H", 600)
+# det 专用图宽度（0 = 不分离）。
+#
+# 实测结论：**不要用这个参数**。
+# 把 det 图从 1080 宽缩到 900/800 宽，音符数从 311 掉到 257/288，
+# 小节数从 24 掉到 20/19 —— 谱面里的字符本来就小，缩 det 图等于
+# 直接丢字。而 det 的 `limit_type='min'` 语义决定：
+#     if min(h, w) < limit_side_len(736):  ratio = 736 / min(h, w)   ← 放大
+#     else:                                ratio = 1                    ← 不缩放
+# 分块后块高 ≈ 723（< 736）→ 放大倍数只有 1.018 倍，
+# 几乎不浪费算力（实测 limit=736 与 limit=603 的框数完全相同：167）。
+# 所以 det 图保持原分辨率即可，此参数留作实验开关（生产值 0）。
+DET_WIDTH = _env_int("OCR_DET_WIDTH", 0)
 
 
 def _row_valleys(gray: np.ndarray,
@@ -130,7 +142,16 @@ def _load_engine():
         1.2.x（本地验证版）：engine.text_detector / engine.text_recognizer
         1.4.x（新版）：      engine.text_det      / engine.text_rec
     两者签名一致（返回 (结果, 耗时)），只是属性名不同。
+
+    建 session **之前**先调 ort_tune：把 onnxruntime 的 intra_op 线程数
+    限制为 1 —— 默认开满物理核会让 80% 的 CPU 烧在自旋等待上
+    （实测 threads=16 → 50.7 CPU 秒，threads=1 → 10.7 CPU 秒）。
+    Render Free 只有 0.1 CPU，这一步是把 150s 压进 60s 的关键。
     """
+    from .ort_tune import tune_ort
+
+    tune_ort()
+
     from rapidocr_onnxruntime import RapidOCR  # type: ignore
 
     return RapidOCR()
@@ -234,12 +255,25 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
                       Image.LANCZOS)
         )
 
+    # ── det 图：可与 rec 图分离（det 更便宜，rec 精度不降）
+    det_w = DET_WIDTH if (DET_WIDTH and DET_WIDTH > 0 and DET_WIDTH < width) else width
+    if det_w == width:
+        det_base = base
+        det_h = height
+        back = 1.0                      # det 坐标 → rec 坐标 的放大倍数
+    else:
+        det_h = max(1, int(round(height * det_w / float(width))))
+        det_base = np.array(
+            Image.fromarray(base).resize((det_w, det_h), Image.LANCZOS)
+        )
+        back = width / float(det_w)
+
     engine = _EngineAdapter(_load_engine())
-    spans = _plan_blocks(gray, height, width)
+    spans = _plan_blocks(gray, det_h, det_w)
 
     items: list[dict] = []
     for (y0, y1) in spans:
-        strip = base[y0:y1]
+        strip = det_base[y0:y1]
         if strip.size == 0:
             continue
 
@@ -250,11 +284,11 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
         if boxes is None or len(boxes) == 0:
             continue
 
-        # det 框（原图系，块内坐标）→ 放大图坐标
+        # det 框（det 图坐标）→ rec 图坐标
         boxes_rec = np.asarray(boxes, dtype=np.float32).copy()
-        boxes_rec[:, :, 0] *= scale
-        boxes_rec[:, :, 1] *= scale
-        boxes_rec[:, :, 1] += y0 * scale
+        boxes_rec[:, :, 0] *= scale * back
+        boxes_rec[:, :, 1] *= scale * back
+        boxes_rec[:, :, 1] += y0 * scale * back
 
         try:
             crops = engine.crop(rec_img, boxes_rec)

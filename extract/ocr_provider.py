@@ -129,6 +129,10 @@ class LocalRapidOcrProvider:
                 "未安装本地 OCR 引擎：pip install rapidocr-onnxruntime",
             ) from exc
         try:
+            # 建 session 前先限制 onnxruntime 线程数（0.1 CPU 上的关键优化）
+            from .ort_tune import tune_ort
+
+            tune_ort()
             self._engine = RapidOCR()
         except Exception as exc:  # noqa: BLE001
             raise OcrProviderError(

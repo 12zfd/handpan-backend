@@ -88,30 +88,100 @@ RapidOCR 的 `det_limit_side_len=736` + `limit_type=min` 语义是：
 _OCR_LOCK = threading.Semaphore(1)   # 串行化 OCR，防止并发峰值叠加
 ```
 
-### 2.5 实测结果矩阵（subproc 真实口径 = 父进程 + 子进程合计 RSS）
+### 2.5 输入归一化：结果与图片尺寸解耦（本轮最终方案）
 
-| tiles | rec_scale | 音符 | 小节 | 峰值内存 | 耗时 |
+原始问题的第二个表现是「同一张谱，不同分辨率上传出来的结果不一样」。
+根因是 RapidOCR 的 det 内部 `limit_type=min` 语义：
+
+- `min(h, w) < limit_side_len(默认 736)` 时 **ratio = limit_side_len / min(h, w)，
+  是「放大」而不是缩小**；
+- 切成 4 块后每块高约 600px < 736 → det 把每块**放大 1.2 倍** → 等效分辨率升高
+  → 召回虚高 → 小节数漂移；
+- 调 `det_limit_side_len` 对结果无影响，因为 ratio 由 `min(h, w)` 决定，
+  而不是由 limit 决定。
+
+**解法：把所有输入统一缩放到固定宽度。**
+
+```python
+# extract/omr.py
+MAX_IMAGE_WIDTH = int(os.environ.get("OCR_NORM_WIDTH") or 1080)
+
+def _normalize(raw, target_width):
+    # 统一缩放到 target_width（既缩也放），而不是"只缩到上限"
+    ...
+```
+
+于是 OCR 与符杠检测**共用同一张 1080 宽的缩放图**（坐标系天然一致，
+不需要来回换算），det 看到的分辨率永远一样。
+
+实测：1080 / 1600 / 2200 / 3000 宽的同一张图，输入归一化后
+**输出结果完全一致**（24 小节 / 311 音符），峰值稳定在 270~350MB。
+
+### 2.6 切块参数实测矩阵（subproc 真实口径 = 父进程 + 子进程合计 RSS）
+
+| 方案 | 音符 | 小节 | 峰值内存 | 耗时 | 判定 |
 |---|---|---|---|---|---|
-| **4** | **1.0** | **311** | **24** | **322MB** | **8.4s** |
-| 4 | 1.5 | 308 | 24 | 350MB | 8.1s |
-| 4 | 2.0 | 310 | 24 | 370MB | 8.0s |
-| 3 | 1.5 | 320 | 25 | 355MB | 8.5s |
-| 5 | 1.5 | 384 | 29 ❌ | 346MB | 9.4s |
-| 6 | 1.5 | 373 | 30 ❌ | 399MB | 11.8s |
-| 8 | 1.5 | 458 | 34 ❌ | 388MB | 13.5s |
+| **固定高度切块 + overlap=120 + 文本去重** | **311** | **24** | **~290MB** | **7.7s** | ✅ **定案** |
+| 固定高度切块 + overlap=120 + 几何去重 | 310 | 23 ❌ | ~290MB | 7.6s | 过度删除 |
+| 固定高度切块 + overlap=0 | 300 | 24 | ~280MB | 7.2s | 掉行 |
+| 行带切块（行投影找行间空白） | 309 | 23 ❌ | ~285MB | 7.9s | 半行截断 |
+| 低谷 + DP 均衡切点 | 309 | 23 ❌ | ~290MB | 7.8s | 半行截断 |
+| 整图 det（不切块） | 309 | 24 | **483MB** | 6.9s | 内存超限风险 |
+| 整图 det 缩到 880 宽 | 240 | 18 ❌ | ~200MB | 5.1s | 召回崩塌 |
 
-**基线（旧通道整图 2x）**：309 字符 / 24 小节 / **峰值 1682MB** / 9.5s
+**基线（旧通道整图 2x 放大）**：309 字符 / 24 小节 / **峰值 1682MB** / 9.5s → 必爆
 
-**定案：`OCR_TILES=4` + `OCR_REC_SCALE=1.0`**
-- 音符 311（基线 309，±2）
-- 小节 **24**（与基线、与谱面自身小节编号 24~47 三方吻合）
-- 峰值 **322MB**（安全余量 190MB）
-- 耗时 **8.4s**（远低于 60s 硬指标）
+**定案：`OCR_TILES=4` + `OCR_TILE_OVERLAP=120` + `OCR_REC_SCALE=1.0` + `OCR_NORM_WIDTH=1080`**
 
-> tiles 调到 5 以上音符数会虚高（重复计数），小节数从 24 漂到 29~34，
-> 反而离真值更远 —— 所以 4 是「召回与准确性同时最优」的点。
+**切块碎片的根因与取舍**（踩坑记录）：
 
-### 2.6 性能日志
+1. det 缩图并不能省内存 —— 1080 宽 121 框 / 483MB，缩到 880 宽只剩 76 框（掉 37%），
+   **召回直接崩塌**。所以只能分块，不能缩图。
+2. 固定高度切块会把一整行**切断** → det 在半行上产出碎片框：
+   - overlap=0 → 框变少（-5 ~ -21），有行整段丢失；
+   - overlap=120 → 碎片变**重复框**，靠文本去重压掉即可。
+3. 几何去重（按 x/y 区间重叠）会**过度删除** → 小节数 24→23，
+   因为相邻小节的字组 x 区间本来就紧邻。最终改用**文本判据**：
+   `text` 相同 + `yc` 差 < max(8, h*0.6) + `x0` 差 < 12。
+4. 符杠检测的「合并竖直碎片」`_merge_vertical` 一旦启用 → 24→25 小节，
+   默认关闭（函数保留，docstring 记录实验结论）。
+5. `cv2.connectedComponentsWithStats` 会分配 **int32 标签图**
+   （3000×6700 = 80MB）→ 符杠检测改为**分带处理**（band ≤ 1024，带间重叠 32px），
+   format_ms 从 4448ms 降到 280ms。
+
+**最终生产代码 3 轮复验**：311 音符 / 24 小节，3 轮结果完全一致，
+耗时 7.6~7.9s，峰值 367~415MB。
+
+> `OCR_TILES` 调到 5 以上音符数会虚高（重复计数），小节数漂到 29~34，
+> 反而离真值更远 —— 4 是「召回与准确性同时最优」的点。
+
+### 2.7 RapidOCR 版本必须锁死（本轮线上事故）
+
+线上曾报 `'RapidOCR' object has no attribute 'text_detector'`。
+原因是 `requirements.txt` 写了 `rapidocr-onnxruntime>=1.2`，pip 装到了 **1.4.4**，
+而 1.4.x 把入口改名了：
+
+| 版本 | 检测入口 | 识别入口 |
+|---|---|---|
+| 1.2.x | `engine.text_detector` | `engine.text_recognizer` |
+| 1.4.x | `engine.text_det` | `engine.text_rec` |
+
+双保险修复：
+
+1. `requirements.txt` 锁 `rapidocr-onnxruntime==1.2.3`（本地完整验证过的版本）；
+2. `extract/ocr_raster.py` 新增 `_EngineAdapter`，同时兼容两代属性名 ——
+   以后即使被升版也不会直接挂。
+
+```python
+class _EngineAdapter:
+    def __init__(self, engine):
+        self._det = getattr(engine, "text_detector", None) or getattr(engine, "text_det", None)
+        self._rec = getattr(engine, "text_recognizer", None) or getattr(engine, "text_rec", None)
+        if self._det is None or self._rec is None:
+            raise RuntimeError("RapidOCR API 不兼容：找不到检测/识别入口")
+```
+
+### 2.8 性能日志
 
 `pipeline.py` 打印分段耗时，一眼看出瓶颈：
 

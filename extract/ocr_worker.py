@@ -32,6 +32,12 @@ def _worker_main() -> int:
         # 关键：子进程内必须强制 inproc，否则会无限递归开子进程。
         os.environ["OCR_IN_WORKER"] = "1"
         os.environ["OCR_RUN_MODE"] = "inproc"
+        # 线程限制必须在建 onnx session 之前生效。
+        # 注意：ORT 线程数由 CPU 配额决定 —— Render Free 只有 0.1 CPU，
+        # 开满物理核会让线程自旋白烧 CPU（实测 44.1 CPU 秒 → 9.5 CPU 秒）。
+        from extract.ort_tune import tune_ort
+
+        tune_ort()
         from extract.ocr_provider import LocalRapidOcrProvider
         provider = LocalRapidOcrProvider()
         timing: dict = {}
@@ -57,6 +63,18 @@ def recognize_in_subprocess(image_bytes: bytes, timeout: float = 120.0,
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_BACKEND) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
+    # OMP 线程数必须在**进程启动前**通过环境变量设定才生效
+    # （ORT 读的是 OMP_NUM_THREADS，运行时改 os.environ 已经太晚）。
+    try:
+        from .ort_tune import ort_threads
+
+        n = ort_threads()
+        if n > 0:
+            for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                        "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                env[var] = str(n)
+    except Exception:  # noqa: BLE001
+        pass
 
     payload = base64.b64encode(image_bytes)
     try:
