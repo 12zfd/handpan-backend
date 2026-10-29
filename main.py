@@ -441,8 +441,23 @@ def root():
 
 
 # ------------------------------------------------------------------ 前端静态托管
-# 本地/单服务部署时，把 vite build 产物挂在根路径；Render 三服务部署时该目录不存在，自动跳过。
-DIST = BASE_DIR.parent / "handpan-frontend" / "dist"
+# 单服务部署：把 vite build 产物放进 backend/frontend-dist/（或用 FRONTEND_DIST 指向别处），
+# 后端直接同源托管前端 —— 用户浏览器里不再有跨域/预检问题。
+# 三服务部署（前端单独托管）时不放这个目录，自动跳过。
+def _find_dist() -> Path | None:
+    env = os.environ.get("FRONTEND_DIST")
+    if env and Path(env).is_dir():
+        return Path(env)
+    local = BASE_DIR / "frontend-dist"
+    if local.is_dir():
+        return local
+    sibling = BASE_DIR.parent / "handpan-frontend" / "dist"
+    if sibling.is_dir():
+        return sibling
+    return None
+
+
+DIST = _find_dist()
 
 
 @app.get("/version")
