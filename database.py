@@ -15,7 +15,8 @@ from sqlalchemy.orm import sessionmaker
 from models import Base
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# 与 storage 共用 DATA_DIR：挂载 Render Disk 后，SQLite 也落在持久盘上
+DATA_DIR = Path(os.environ.get("DATA_DIR") or (BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
