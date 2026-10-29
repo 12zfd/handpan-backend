@@ -7,9 +7,11 @@ Render 生产：配置 DATABASE_URL（Internal Database URL）即切到 PostgreS
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 from models import Base
@@ -36,9 +38,17 @@ DATABASE_URL = _normalize(
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    engine = create_engine(
-        DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=1800
-    )
+    _kwargs: dict = dict(pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=1800)
+    # Render 免费容器没有 IPv6 出网，而 Neon 域名是双栈解析；
+    # 显式解析一个 IPv4 交给 psycopg（host 仍用于 TLS 证书校验），避免 it 只试 IPv6 而失败。
+    try:
+        _host = make_url(DATABASE_URL).host
+        _infos = socket.getaddrinfo(_host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if _infos:
+            _kwargs["connect_args"] = {"hostaddr": _infos[0][4][0]}
+    except OSError:
+        pass  # 解析失败就按默认行为连接
+    engine = create_engine(DATABASE_URL, **_kwargs)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
