@@ -28,16 +28,16 @@ services:
       - key: CORS_ORIGINS
         sync: false            # 填前端域名，如 https://handpan-frontend.onrender.com
 
-  # ─────────────────────────────── 前端
+  # ─────────────────────────────── 前端（纯静态单文件，无需构建）
   - type: web
     name: handpan-frontend
     runtime: static
     repo: https://github.com/12zfd/handpan-frontend
-    buildCommand: npm ci && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_BASE_URL
-        sync: false            # 填后端域名，如 https://handpan-backend.onrender.com
+    buildCommand:                   # 纯 HTML，不需要构建，留空即可
+      - echo "static site - no build needed"
+    staticPublishPath: .            # index.html 就在仓库根目录
+    # 纯 HTML 前端在运行时自动探测后端地址（同源 / 绝对地址自动切换），
+    # 不再需要 VITE_API_BASE_URL 这类构建期变量。
 
 databases:
   - name: handpan-db
