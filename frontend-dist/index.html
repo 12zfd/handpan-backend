@@ -208,7 +208,7 @@ var MAX_FILES = 5;
 var IMAGE_EXT = /\.(jpe?g|png)$/i;
 // 上传前把图片压到这个宽度：OCR 峰值内存 402MB < Render Free 512MB
 // （1080px 原图峰值 1628MB 会把实例打爆，BackgroundTask 丢失 → 永久卡「提取中」）
-var MAX_UPLOAD_W = 480;
+var MAX_UPLOAD_W = 400;
 // 同一状态停留超过这个秒数就判定为卡死（实例重启后任务不会自己恢复）
 var STUCK_SEC = 300;
 var MIDI_MAP = {1:50,2:57,3:58,4:60,5:62,6:64,7:65,8:67,9:69};
