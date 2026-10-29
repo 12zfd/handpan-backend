@@ -428,9 +428,9 @@ def healthz():
     return {"ok": True, "ts": int(time.time())}
 
 
-@app.get("/")
+@app.get("/api-status")
 def root():
-    """根路径：浏览器直接打开后端地址时给出友好提示，而不是 404。"""
+    """API 状态页（同源托管前端时，/ 由静态挂载提供应用页面）。"""
     return {
         "service": "handpan-backend",
         "status": "running",
