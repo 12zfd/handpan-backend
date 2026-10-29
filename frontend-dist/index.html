@@ -610,6 +610,9 @@ function addFiles(list){
 function renderPending(){
   var box = $('pending-box');
   if(!box) return;
+  // drop-title 必须在 pending 清空的分支之前更新，否则转换完成后会一直停在「上传中…」
+  var dt = $('drop-title');
+  if(dt) dt.textContent = S.busy ? '上传中…' : ('继续添加（已选 '+S.pending.length+' 张）');
   if(!S.pending.length){ box.innerHTML=''; return; }
   var multi = S.pending.length > 1;
   box.innerHTML =
@@ -646,7 +649,6 @@ function renderPending(){
       renderPending();
     });
   });
-  $('drop-title').textContent = S.busy ? '上传中…' : ('继续添加（已选 '+S.pending.length+' 张）');
 }
 
 async function startConvert(){
