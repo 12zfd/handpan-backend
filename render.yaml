@@ -3,7 +3,7 @@ services:
   - type: web
     name: handpan-backend
     runtime: python
-    plan: starter              # 免费 512MB 跑不动 OCR（onnxruntime + 模型），必须 starter
+    plan: free                 # 免费层 0.1 CPU / 512MB：分块 det + 子进程 OCR 已实测峰值 322MB，可跑
     repo: https://github.com/12zfd/handpan-backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -27,6 +27,23 @@ services:
         value: tab
       - key: CORS_ORIGINS
         sync: false            # 填前端域名，如 https://handpan-frontend.onrender.com
+      # ── OCR 性能参数（512MB 下的实测最优组合，见 docs/PERFORMANCE.md）
+      - key: OCR_RUN_MODE
+        value: subproc         # 每次识别开独立子进程，arena 不累积、OOM 不拖垮主进程
+      - key: OCR_TILES
+        value: "4"             # 竖向切 4 块做检测，峰值内存 ÷ 4
+      - key: OCR_TILE_OVERLAP
+        value: "120"           # 相邻块重叠，防跨块行被切断
+      - key: OCR_BLOCK_H
+        value: "600"           # 目标块高（像素），据此动态决定块数
+      - key: OCR_REC_SCALE
+        value: "1.0"           # 识别用原图裁剪（峰值更低，结果与 2x 一致）
+      - key: OCR_NORM_WIDTH
+        value: "1080"          # 所有输入统一归一化到 1080 宽 → 结果与输入尺寸无关
+      - key: OCR_PROVIDER
+        value: local           # 配了 CLOUD_OCR_ENDPOINT 会自动切云端 OCR
+      - key: LOG_LEVEL
+        value: INFO            # 打印【解码/推理/格式化】分段耗时
 
   # ─────────────────────────────── 前端（纯静态单文件，无需构建）
   - type: web

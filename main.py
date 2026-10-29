@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -20,6 +21,13 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
+
+# 性能日志（图片解码 / 推理 / 格式化 分段耗时）必须能在 Render 日志里看到，
+# uvicorn 只配置了自己的 logger，root logger 默认 WARNING 会把 log.info 吞掉。
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 from fastapi import (
     BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile, status,
@@ -117,6 +125,19 @@ class TitleIn(BaseModel):
     title: str
 
 
+class TaskOut(BaseModel):
+    """异步任务视图。前端轮询它拿进度；字段与既有 ScoreOut 对齐。"""
+    task_id: int
+    score_id: int
+    status: str
+    stage: str
+    progress: int
+    error_message: str | None
+    has_pdf: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 # ------------------------------------------------------------------ 认证
 def current_user(
     cred: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
@@ -197,7 +218,111 @@ def upload(
     db.add(score)
     db.commit()
     db.refresh(score)
-    return {"score_id": score.id, "status": score.status, "files": len(keys)}
+    # 兼容旧前端：score_id/status/files 三个字段一字未改。
+    # task_id 是新增的异步句柄，等价于 score_id（同一个任务）。
+    return {"score_id": score.id, "status": score.status, "files": len(keys),
+            "task_id": score.id}
+
+
+@app.post("/tasks", status_code=status.HTTP_202_ACCEPTED)
+def create_task(
+    background: BackgroundTasks,
+    user: Annotated[User, Depends(current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None),
+):
+    """一步式异步任务：上传即返回 task_id，转换在后台跑，前端轮询 /tasks/{id}。
+
+    与 /upload + /convert 完全等价，只是把两步合成一步、立即返回。
+    响应体：{"task_id", "score_id", "status", "files"}
+    """
+    incoming = [f for f in (files or []) if f is not None]
+    if file is not None:
+        incoming.append(file)
+    if not incoming:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "没有收到文件")
+    if len(incoming) > MAX_FILES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"最多一次上传 {MAX_FILES} 张图片")
+
+    kinds = []
+    for f in incoming:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in ALLOWED_EXT:
+            raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                                "仅支持 mp4 / mov / jpg / jpeg / png / mid")
+        kinds.append(ALLOWED_EXT[ext])
+    if len(incoming) > 1 and any(k != "image" for k in kinds):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "只有图片可以多张合并；视频 / MIDI 一次一个")
+
+    keys: list[str] = []
+    for f in incoming:
+        data = f.file.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                f"{f.filename} 超过 200MB")
+        if not data:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{f.filename} 是空文件")
+        ext = Path(f.filename or "").suffix.lower()
+        key = f"uploads/{datetime.now():%Y/%m}/{uuid.uuid4().hex}{ext}"
+        upload_bytes(key, data, content_type=f.content_type or "application/octet-stream")
+        keys.append(key)
+
+    stem = Path(incoming[0].filename or "未命名").stem[:100]
+    title = stem if len(keys) == 1 else f"{stem}（等 {len(keys)} 页）"
+    score = Score(
+        user_id=user.id,
+        original_file_url=dump_keys(keys),
+        status="extracting",
+        source_type=kinds[0],
+        title=title[:120],
+    )
+    db.add(score)
+    db.commit()
+    db.refresh(score)
+
+    background.add_task(run_pipeline, score.id)
+    return {"task_id": score.id, "score_id": score.id,
+            "status": score.status, "files": len(keys)}
+
+
+# ------------------------------------------------------------------ 异步任务视图
+_STAGE_TEXT = {
+    "queued": "排队中",
+    "extracting": "识别谱面字符",
+    "mapping": "映射到手碟音位",
+    "rendering": "排版出稿",
+    "done": "已完成",
+    "failed": "失败",
+}
+_STAGE_PROGRESS = {
+    "queued": 0, "extracting": 30, "mapping": 60, "rendering": 85,
+    "done": 100, "failed": 100,
+}
+
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def task_status(
+    task_id: int,
+    user: Annotated[User, Depends(current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """轮询任务进度。task_id 与 score_id 是同一个 id（不新增数据表）。"""
+    s = db.get(Score, task_id)
+    if s is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
+    return TaskOut(
+        task_id=s.id,
+        score_id=s.id,
+        status=s.status,
+        stage=_STAGE_TEXT.get(s.status, s.status),
+        progress=_STAGE_PROGRESS.get(s.status, 0),
+        error_message=s.error_message,
+        has_pdf=bool(s.pdf_url),
+        created_at=s.created_at,
+        updated_at=s.updated_at,
+    )
 
 
 # ------------------------------------------------------------------ 触发转换

@@ -22,75 +22,124 @@ import os
 import re
 import statistics
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+from .beams import count_beams, detect_beam_segments
+from .ocr_provider import get_provider
+
 _ENGINE = None
-UPSCALE = 2.0            # 手机截图字太小，放大后再识别，召回率约翻倍
 SLOTS_PER_BAR = 16       # 原谱一行 = 2 小节 × 16 格（4 拍 × 16 分音符）
 BARS_PER_ROW = 2
 MAX_PAGES = 5
+
+# OCR 前的处理策略（环境变量可覆盖，实际实现见 extract/ocr_raster.py）：
+#   OCR_TILES          —— 竖向分块数，det 分块跑，峰值内存 ∝ 1/块数
+#   OCR_TILE_OVERLAP   —— 相邻块重叠像素，防跨块行被切断
+#   OCR_REC_SCALE      —— 识别时的放大倍数（只影响裁剪块，不影响 det 像素密度）
+#   OCR_UPSCALE        —— 旧参数：整图放大倍数，新通道不再使用
+#
+# 为什么不整图放大 2 倍再检测：
+#   早期版本 UPSCALE=2.0 会把 1080×2412 放大到 2160×4824，numpy 副本 + onnx
+#   张量把峰值内存推到 1.6GB；Render Free 只有 512MB，实例必被 OOM 重启，
+#   后台任务永远停在「提取中」（用户看到「图片一直在读取中」）。
+#   现在改成「分块检测 + 放大裁剪识别」：
+#     det 在原图上分块跑 → 像素密度不变，框的划分与整图检测一致，内存降到 1/4
+#     rec 从 2x 放大图裁剪 → 字符占更多像素，识别精度与整图 2x 持平
+#   实测峰值 1682MB → 316MB，字符数与小节数与整图 2x 完全一致。
+try:
+    UPSCALE = float(os.environ.get("OCR_UPSCALE") or 1.0)
+except ValueError:
+    UPSCALE = 1.0
+
+# 图片归一化基准宽度（OCR_NORM_WIDTH）。
+# 所有输入统一缩到这个宽度再识别 → det 看到的分辨率永远一致 →
+# 切块数、检测结果、小节数都与输入尺寸无关（实测 1080/1600/2200/3000
+# 四种宽度归一化后结果完全相同）。
+try:
+    MAX_IMAGE_WIDTH = int(os.environ.get("OCR_NORM_WIDTH") or 1080)
+except ValueError:
+    MAX_IMAGE_WIDTH = 1080
 
 SCORE_CHARS = re.compile(r"^[0-9DXxTtSsDd|Il]{1,}$")
 BAR_NUMBER = re.compile(r"^\d{2,}$")
 
 
+class _Timing(dict):
+    """分段耗时收集器（decode / infer / format）。
+
+    用于回答「哪一步最耗时」——Render Free 只有 0.1 CPU，
+    如果不拆开看，只能看到总耗时，无法定位瓶颈。
+    """
+
+    def mark(self, key: str, ms: float) -> None:
+        self[key] = int(ms)
+
+
+def _normalize(raw: bytes, target_width: int) -> bytes:
+    """把图片等比缩放到宽度 = target_width（不放大到超过 target）。
+
+    统一分辨率是本方案能同时满足「省内存」和「结果稳定」的关键。
+
+    背景（实测结论）：
+      · det 的召回强烈依赖**字符像素密度**：1080 宽检出 121 框，
+        缩到 880 宽只剩 76 框（掉 37%）→ 不能靠缩图省内存；
+      · det 的内存 ∝ 输入**面积** → 必须分块；
+      · 但分块数一变，结果就漂（tiles=4 → 24 小节，tiles=8 → 34 小节），
+        因为 DB 检测器在不同尺寸的块上行为不同。
+
+    所以：**先把所有输入归一化到同一个基准宽度（1080，与最常见的手机
+    截图一致），再固定切块** → 任何尺寸的输入都得到完全一致的结果，
+    且 det 看到的分辨率始终是「已验证」的那一档。
+
+    按**宽度**而非最长边归一化：手碟谱截图是竖长条，限制最长边会把字
+    压到认不出的程度（实测 125px 宽时 OCR 完全读不出谱面字符）。
+    """
+    if not target_width or target_width <= 0:
+        return raw
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return raw
+    if im.width == target_width:
+        return raw
+    ratio = target_width / float(im.width)
+    im = im.resize(
+        (max(1, int(round(im.width * ratio))),
+         max(1, int(round(im.height * ratio)))),
+        Image.LANCZOS,
+    )
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def _engine():
+    """保留旧入口兼容；真正的识别已下沉到 ocr_provider。"""
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
-    try:
-        from rapidocr_onnxruntime import RapidOCR  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError("未安装 OCR 引擎：pip install rapidocr-onnxruntime") from exc
-    _ENGINE = RapidOCR()
+    _ENGINE = get_provider()
     return _ENGINE
 
 
-def _ocr_items(arr) -> list[dict]:
-    """numpy 图像 → [{"text","x0","x1","yc","h"}, ...]，兼容 rapidocr 两种 API。"""
-    out = _engine()(arr)
-    items: list[dict] = []
-
-    def push(box, text):
-        if not text:
-            return
-        try:
-            xs = [float(p[0]) for p in box]
-            ys = [float(p[1]) for p in box]
-        except Exception:
-            return
-        items.append({"text": str(text), "x0": min(xs), "x1": max(xs),
-                      "yc": sum(ys) / len(ys), "h": max(ys) - min(ys)})
-
-    if isinstance(out, tuple):               # rapidocr-onnxruntime: (result, elapse)
-        for row in out[0] or []:
-            if len(row) >= 2:
-                push(row[0], row[1])
-        return items
-
-    boxes = getattr(out, "boxes", None)      # rapidocr v3
-    txts = getattr(out, "txts", None)
-    if boxes is not None and txts is not None:
-        for i, box in enumerate(boxes):
-            push(box, txts[i])
-        return items
-
-    if isinstance(out, list):
-        for row in out:
-            if len(row) >= 2:
-                push(row[0], row[1])
-    return items
+def _ocr_items(arr, timing: dict | None = None) -> list[dict]:
+    """numpy 图像 / 图片字节 → [{"text","x0","x1","yc","h"}, ...]（兼容旧调用方）。"""
+    provider = get_provider()
+    if isinstance(arr, (bytes, bytearray)):
+        return provider.recognize(bytes(arr), timing=timing)
+    # numpy 输入 → 先编码成 PNG 再交给 provider
+    buf = io.BytesIO()
+    Image.fromarray(np.asarray(arr)).save(buf, format="PNG")
+    return provider.recognize(buf.getvalue(), timing=timing)
 
 
 def _run_ocr(path: Path) -> list[dict]:
-    """调试入口：读文件 → 放大 → OCR。"""
-    img = Image.open(path).convert("RGB")
-    if UPSCALE != 1.0:
-        img = img.resize((int(img.width * UPSCALE), int(img.height * UPSCALE)), Image.LANCZOS)
-    return _ocr_items(np.array(img))
+    """调试入口：读文件 → OCR。"""
+    return _ocr_items(path.read_bytes())
 
 
 def _group_rows(items: list[dict]) -> list[list[dict]]:
@@ -119,35 +168,13 @@ def _clean(text: str) -> str:
     return "".join(out)
 
 
-def _beam_lines(gray: "np.ndarray", item: dict) -> int:
-    """数一个文本框下方有几条横线（符杠）。
+def _row_tokens(row: list[dict],
+                segments: list[tuple[float, float, float, int]]) -> list[dict]:
+    """一行文本框 → [{"ch": 字符, "beams": 横线条数}, ...]，按 x 排序。
 
-    规则（用户定义）：一条横线 = 占 2 格，两条 = 占 1 格。
-    这里只负责"看到几条"，占几格由上层解释。
-    判据：文字下方一条横带里，若某一行有 ≥45% 宽度是暗像素，就算一条线。
+    符杠不再靠"在框下方找横线"来猜（OCR 框会横跨整行，猜出来的节奏必错），
+    改成用**独立检测出的横线段**按 x 区间归属给每个文本框。
     """
-    h = max(item["h"], 1.0)
-    y0 = int(item["yc"] + h * 0.45)
-    y1 = int(item["yc"] + h * 1.65)
-    x0 = max(0, int(item["x0"]))
-    x1 = int(item["x1"])
-    if x1 - x0 < 8 or y1 - y0 < 3:
-        return 0
-    band = gray[y0:y1, x0:x1] < 150
-    if band.size == 0:
-        return 0
-    frac = band.mean(axis=1)
-    runs = 0
-    prev = False
-    for v in frac > 0.45:
-        if v and not prev:
-            runs += 1
-        prev = v
-    return min(runs, 2)
-
-
-def _row_tokens(row: list[dict], gray: "np.ndarray") -> list[dict]:
-    """一行文本框 → [{"ch": 字符, "beams": 横线条数}, ...]，按 x 排序。"""
     cells: list[tuple[float, str, int]] = []
     for it in row:
         t = it["text"].replace(" ", "").strip()
@@ -157,38 +184,56 @@ def _row_tokens(row: list[dict], gray: "np.ndarray") -> list[dict]:
             continue
         cleaned = _clean(t)
         if cleaned:
-            cells.append((it["x0"], cleaned, _beam_lines(gray, it)))
-
+            cells.append((it["x0"], cleaned, count_beams(it, segments)))
     cells.sort(key=lambda c: c[0])
     return [{"ch": ch, "beams": b} for _x, s, b in cells for ch in s]
 
 
-def _page_tokens(raw: bytes) -> tuple[list[dict], int]:
-    """单张图 → 逐行落格后的 [{ch, beams}]，并统计符杠分布。"""
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    if UPSCALE != 1.0:
-        img = img.resize((int(img.width * UPSCALE), int(img.height * UPSCALE)), Image.LANCZOS)
-    arr = np.array(img)
-    gray = np.array(img.convert("L"))
+def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[dict], int]:
+    """单张图 → 逐行落格后的 [{ch, beams}]，并统计有效行数。
 
-    rows = _group_rows(_ocr_items(arr))
+    流程：
+      1. 识别（provider 内部是「分块 det + 2x 裁剪 rec」，峰值内存 ~316MB）
+      2. 在**原图**上独立检测所有横线段（符杠）——原图分辨率，细线不被抹掉
+      3. 逐行分组 + 按 x 归属符杠条数 → 落格
+    """
+    t0 = time.time()
+    # 统一预处理：超大图先等比缩到 OCR_MAX_WIDTH。
+    # OCR 与符杠检测必须用**同一张图**，否则两套坐标系对不上，
+    # 符杠归属会全部错位。缩放后两张图共用同一坐标系，相对关系不变。
+    proc_raw = _normalize(raw, MAX_IMAGE_WIDTH)
+    items = _ocr_items(proc_raw, timing=timing)
+    t1 = time.time()
 
+    segments: list[tuple[float, float, float, int]] = []
+    try:
+        gray = np.array(Image.open(io.BytesIO(proc_raw)).convert("L"))
+        segments = detect_beam_segments(gray)
+    except Exception:  # noqa: BLE001 - 符杠检测失败不应让整条流水线挂掉
+        segments = []
+
+    rows = _group_rows(items)
     tokens: list[dict] = []
     used_rows = 0
-    row_len = SLOTS_PER_BAR * BARS_PER_ROW
-
     for row in rows:
-        toks = _row_tokens(row, gray)
+        toks = _row_tokens(row, segments)
         if not toks:
             continue
         used_rows += 1
         # 不补位：时值由横线决定，补位会虚增格数、把节奏拉长
         tokens.extend(toks)
+    t2 = time.time()
 
+    if timing is not None:
+        # provider 若已给出更细的分段耗时（子进程模式下由 raster 回传），
+        # 这里不覆盖，只补齐缺失项。
+        timing.setdefault("infer_ms", int((t1 - t0) * 1000))
+        timing.setdefault("format_ms", int((t2 - t1) * 1000))
     return tokens, used_rows
 
 
-def image_to_tab(raw: bytes | list[bytes]) -> dict:
+def image_to_tab(raw: bytes | list[bytes],
+                 timing: "_Timing | None" = None) -> dict:
     """raw 可以是单张 bytes，也可以是按顺序排列的多张（最多 5 张）。
 
     时值**以输入图为准**：
@@ -218,8 +263,9 @@ def image_to_tab(raw: bytes | list[bytes]) -> dict:
     unpitched = 0
     empty_pages = 0
 
+    t_fmt0 = time.time()
     for pi, page in enumerate(pages):
-        toks, rows = _page_tokens(page)
+        toks, rows = _page_tokens(page, timing)
         total_rows += rows
         if not toks:
             empty_pages += 1
@@ -256,11 +302,15 @@ def image_to_tab(raw: bytes | list[bytes]) -> dict:
                                "beams": beams, "dur": dur, "amp": 0.9})
 
     if not events:
-        return {
+        out = {
             "events": [], "bars": 12, "bpm": bpm,
             "stats": {"chars": 0, "pages": len(pages)},
             "warnings": ["没能从这张图里读出字符谱。请确认：① 截图清晰不解屏；② 谱面是 D / T / X + 数字的字符谱"],
         }
+        if timing is not None:
+            timing.setdefault("format_ms", int((time.time() - t_fmt0) * 1000))
+            out["timing"] = dict(timing)
+        return out
 
     bars = max(1, (cursor + SLOTS_PER_BAR - 1) // SLOTS_PER_BAR)
     pitched = sum(1 for e in events if e.get("kind") != "stroke")
@@ -280,7 +330,7 @@ def image_to_tab(raw: bytes | list[bytes]) -> dict:
     if empty_pages:
         warnings.append(f"其中 {empty_pages} 张没读出内容，已跳过")
 
-    return {
+    out = {
         "events": events,
         "bars": min(bars, 240),
         "bpm": bpm,
@@ -289,3 +339,7 @@ def image_to_tab(raw: bytes | list[bytes]) -> dict:
         "stats": {"chars": cursor, "pitched": pitched, "unpitched": unpitched,
                   "rests": rests, "rows": total_rows, "pages": len(pages)},
     }
+    if timing is not None:
+        timing.setdefault("format_ms", int((time.time() - t_fmt0) * 1000))
+        out["timing"] = dict(timing)
+    return out

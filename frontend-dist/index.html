@@ -206,11 +206,6 @@ var BACKEND = 'https://handpan-backend.onrender.com';
 
 var MAX_FILES = 5;
 var IMAGE_EXT = /\.(jpe?g|png)$/i;
-// 上传前把图片压到这个宽度：OCR 峰值内存 402MB < Render Free 512MB
-// （1080px 原图峰值 1628MB 会把实例打爆，BackgroundTask 丢失 → 永久卡「提取中」）
-var MAX_UPLOAD_W = 400;
-// 同一状态停留超过这个秒数就判定为卡死（实例重启后任务不会自己恢复）
-var STUCK_SEC = 300;
 var MIDI_MAP = {1:50,2:57,3:58,4:60,5:62,6:64,7:65,8:67,9:69};
 var DEFAULT_CELLS = 12;
 var SYS_H = 70;
@@ -236,13 +231,6 @@ function esc(v){
   });
 }
 function $(id){ return document.getElementById(id); }
-// 任务已持续多少秒（created_at 缺失时返回 0）
-function ageSec(ts){
-  if(!ts) return 0;
-  var t = Date.parse(ts);
-  if(isNaN(t)) return 0;
-  return Math.max(0, (Date.now() - t) / 1000);
-}
 function token(){ return localStorage.getItem(TOKEN_KEY) || ''; }
 function user(){ return localStorage.getItem(USER_KEY) || ''; }
 function setAuth(t,u){ localStorage.setItem(TOKEN_KEY,t); localStorage.setItem(USER_KEY,u||''); }
@@ -604,63 +592,11 @@ function renderApp(){
   }catch(e){}
 }
 
-/* ------------------------------------------------------------------ 图片压缩 */
-// 浏览器端等比缩到 MAX_UPLOAD_W 宽再上传。
-// 目的不是省流量，而是把后端 OCR 的瞬时内存峰值压到 512MB 以内，
-// 否则 Render 免费实例会被 OOM 杀掉，任务卡在「提取中」永远不结束。
-// 视频 / MIDI 不做处理（OCR 通道不涉及，音频通道没有大图张量问题）。
-function shrinkImageFile(file){
-  return new Promise(function(resolve){
-    if(!IMAGE_EXT.test(file.name || '')) return resolve(file);
-    var bitmap = null;
-    try{
-      bitmap = createImageBitmap(file);
-    }catch(e){
-      return resolve(file);
-    }
-    bitmap.then(function(bmp){
-      if(!bmp || !bmp.width || bmp.width <= MAX_UPLOAD_W){
-        if(bmp && bmp.close) bmp.close();
-        return resolve(file);
-      }
-      var ratio = MAX_UPLOAD_W / bmp.width;
-      var w = MAX_UPLOAD_W;
-      var h = Math.max(1, Math.round(bmp.height * ratio));
-      var cv = document.createElement('canvas');
-      cv.width = w; cv.height = h;
-      var ctx = cv.getContext('2d');
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(bmp, 0, 0, w, h);
-      if(bmp.close) bmp.close();
-      cv.toBlob(function(blob){
-        if(!blob || !blob.size) return resolve(file);
-        var base = (file.name || 'score').replace(/\.[^.]+$/, '');
-        var out = new File([blob], base + '.png', {type:'image/png', lastModified:Date.now()});
-        out.__shrunk = true;
-        resolve(out);
-      }, 'image/png');
-    }).catch(function(){
-      resolve(file);
-    });
-  });
-}
-
 /* ------------------------------------------------------------------ 待转换列表 */
-async function addFiles(list){
+function addFiles(list){
   var arr = Array.prototype.slice.call(list||[]).filter(Boolean);
   $('file-input').value = '';
   if(!arr.length) return;
-  if(arr.some(function(f){ return f && f.__needShrink; })) return;
-  // 图片先在浏览器里压到安全宽度，再进待转换队列
-  var imgs = arr.filter(function(f){ return IMAGE_EXT.test(f.name||''); });
-  if(imgs.length){
-    setNotice(null);
-    var shrunk = await Promise.all(arr.map(function(f){
-      return IMAGE_EXT.test(f.name||'') ? shrinkImageFile(f) : Promise.resolve(f);
-    }));
-    arr = shrunk;
-  }
   var next = S.pending.concat(arr);
   if(next.length > MAX_FILES){ setNotice('err','最多 '+MAX_FILES+' 张，现在已经 '+next.length+' 张'); return; }
   if(next.length > 1 && !next.every(function(f){ return IMAGE_EXT.test(f.name||''); })){
@@ -692,7 +628,7 @@ function renderPending(){
           return '<li>'+
             '<span class="idx">'+(i+1)+'</span>'+
             '<span class="nm" title="'+esc(f.name)+'">'+esc(f.name)+'</span>'+
-            '<span class="sz">'+fmtSize(f.size)+(f.__shrunk?'（已压缩）':'')+'</span>'+
+            '<span class="sz">'+fmtSize(f.size)+'</span>'+
             '<button class="rm" data-rm="'+i+'">移除</button>'+
           '</li>';
         }).join('')+
@@ -765,19 +701,14 @@ function renderRows(){
     var m = STATUS_META[r.status] || STATUS_META.queued;
     var src = SOURCE_LABEL[r.source_type] || '文件';
     var sub = src + ' · ' + fmtTime(r.created_at) + (r.error_message ? (' · ' + r.error_message) : '');
-    var stuck = ACTIVE.indexOf(r.status) >= 0 && ageSec(r.created_at) > STUCK_SEC;
     var acts = '';
     if(r.status === 'done'){
       acts += '<button class="mini" data-open="'+r.id+'">预览 / 校对</button>'+
               '<button class="mini blueline" data-dl="'+r.id+'">下载 PDF</button>';
-    } else if(r.status === 'failed' || r.status === 'queued' || stuck){
-      acts += '<button class="mini" data-retry="'+r.id+'">'+(stuck?'重新转换':(r.status==='failed'?'重试':'开始转换'))+'</button>';
+    } else if(r.status === 'failed' || r.status === 'queued'){
+      acts += '<button class="mini" data-retry="'+r.id+'">'+(r.status==='failed'?'重试':'开始转换')+'</button>';
     } else {
       acts += '<span class="waiting">处理中…</span>';
-    }
-    if(stuck){
-      m = {text:'疑似卡住', cls:'b-f'};
-      sub += ' · 超过 '+Math.round(STUCK_SEC/60)+' 分钟未完成，可点「重新转换」';
     }
     return '<div class="item">'+
       '<div class="item-main">'+
