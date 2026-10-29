@@ -21,7 +21,13 @@ imageio-ffmpeg>=0.4.9
 mido>=1.2
 
 # 字符谱 OCR（离线，自带模型，约 +90MB；不装则截图走手动录入）
-rapidocr-onnxruntime>=1.2
+# ⚠️ 版本必须锁死：1.4.x 把 RapidOCR 的检测/识别入口从
+#    text_detector/text_recognizer 改名成 text_det/text_rec，
+#    且全局预处理参数（max_side_len/min_side_len）变了 —— 一旦被 pip 升版，
+#    线上会直接报 "'RapidOCR' object has no attribute 'text_detector'"。
+#    代码里已加兼容层（extract/ocr_raster.py::_EngineAdapter），
+#    但锁版本才能保证「本地验证过的行为 == 线上行为」。
+rapidocr-onnxruntime==1.2.3
 pillow>=10.0
 
 # 生产对象存储（本地可不装）

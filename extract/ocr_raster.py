@@ -124,9 +124,52 @@ def _plan_blocks(gray: np.ndarray, height: int, width: int) -> list[tuple[int, i
 
 
 def _load_engine():
+    """加载 RapidOCR 引擎。
+
+    兼容 rapidocr-onnxruntime 的两代 API：
+        1.2.x（本地验证版）：engine.text_detector / engine.text_recognizer
+        1.4.x（新版）：      engine.text_det      / engine.text_rec
+    两者签名一致（返回 (结果, 耗时)），只是属性名不同。
+    """
     from rapidocr_onnxruntime import RapidOCR  # type: ignore
 
     return RapidOCR()
+
+
+class _EngineAdapter:
+    """把两代 RapidOCR 的属性名差异统一掉。
+
+    1.2.x: engine.text_detector(img)  → (boxes, elapse)
+            engine.text_recognizer(crops) → ([(text, conf), ...], elapse)
+            engine.get_crop_img_list(img, boxes) → [crop, ...]
+    1.4.x: engine.text_det(img) / engine.text_rec(crops)，其余一致。
+    """
+
+    def __init__(self, engine):
+        self._e = engine
+        self._det = getattr(engine, "text_detector", None)
+        self._rec = getattr(engine, "text_recognizer", None)
+        if self._det is None:
+            self._det = getattr(engine, "text_det", None)
+        if self._rec is None:
+            self._rec = getattr(engine, "text_rec", None)
+        if self._det is None or self._rec is None:
+            raise RuntimeError(
+                "RapidOCR API 不兼容：找不到检测/识别入口"
+                f"（text_detector/text_det={self._det is not None}, "
+                f"text_recognizer/text_rec={self._rec is not None}）"
+            )
+
+    def detect(self, img):
+        out = self._det(img)
+        return out[0] if isinstance(out, tuple) else out
+
+    def recognize(self, crops):
+        out = self._rec(crops)
+        return out[0] if isinstance(out, tuple) else out
+
+    def crop(self, img, boxes):
+        return self._e.get_crop_img_list(img, boxes)
 
 
 def _dedup(items: list[dict]) -> list[dict]:
@@ -191,7 +234,7 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
                       Image.LANCZOS)
         )
 
-    engine = _load_engine()
+    engine = _EngineAdapter(_load_engine())
     spans = _plan_blocks(gray, height, width)
 
     items: list[dict] = []
@@ -201,21 +244,21 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
             continue
 
         try:
-            boxes, _ = engine.text_detector(strip)
+            boxes = engine.detect(strip)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"本地 OCR 检测失败：{exc}") from exc
         if boxes is None or len(boxes) == 0:
             continue
 
         # det 框（原图系，块内坐标）→ 放大图坐标
-        boxes_rec = boxes.astype(np.float32).copy()
+        boxes_rec = np.asarray(boxes, dtype=np.float32).copy()
         boxes_rec[:, :, 0] *= scale
         boxes_rec[:, :, 1] *= scale
         boxes_rec[:, :, 1] += y0 * scale
 
         try:
-            crops = engine.get_crop_img_list(rec_img, boxes_rec)
-            results, _ = engine.text_recognizer(crops)
+            crops = engine.crop(rec_img, boxes_rec)
+            results = engine.recognize(crops)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"本地 OCR 识别失败：{exc}") from exc
 
