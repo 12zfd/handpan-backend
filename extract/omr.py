@@ -34,6 +34,7 @@ from .ocr_provider import get_provider
 _ENGINE = None
 SLOTS_PER_BAR = 16       # 原谱一行 = 2 小节 × 16 格（4 拍 × 16 分音符）
 BARS_PER_ROW = 2
+ROW_SLOTS = SLOTS_PER_BAR * BARS_PER_ROW   # 每行固定 32 格：行对齐的基石
 MAX_PAGES = 5
 
 # OCR 前的处理策略（环境变量可覆盖，实际实现见 extract/ocr_raster.py）：
@@ -66,6 +67,14 @@ except ValueError:
 
 SCORE_CHARS = re.compile(r"^[0-9DXxTtSsDd|Il]{1,}$")
 BAR_NUMBER = re.compile(r"^\d{2,}$")
+
+# 有效谱面行的最小 x 跨度（归一化 1080 宽坐标系）。
+# 一行 32 格 × ~23px ≈ 700px，即使右半漏读也有 350px 左右；
+# 指法图例、竖排小字这类异物通常 < 300px。
+try:
+    MIN_ROW_SPAN = float(os.environ.get("OCR_MIN_ROW_SPAN") or 300)
+except ValueError:
+    MIN_ROW_SPAN = 300.0
 
 
 class _Timing(dict):
@@ -168,14 +177,14 @@ def _clean(text: str) -> str:
     return "".join(out)
 
 
-def _row_tokens(row: list[dict],
-                segments: list[tuple[float, float, float, int]]) -> list[dict]:
-    """一行文本框 → [{"ch": 字符, "beams": 横线条数}, ...]，按 x 排序。
+def _row_chars(row: list[dict]) -> list[tuple[float, str, float]]:
+    """一行文本框 → [(字符中心x, 字符, 字符宽), ...]，按 x 排序。
 
-    符杠不再靠"在框下方找横线"来猜（OCR 框会横跨整行，猜出来的节奏必错），
-    改成用**独立检测出的横线段**按 x 区间归属给每个文本框。
+    OCR 会把相邻几个字符合并成一个文本框（如 "TXXDXDXD"）。
+    框内每个字符的真实 x 未知，按「字符数均分框宽」估计：
+    对等宽字符谱（数字/字母）这是足够好的近似。
     """
-    cells: list[tuple[float, str, int]] = []
+    chars: list[tuple[float, str, float]] = []
     for it in row:
         t = it["text"].replace(" ", "").strip()
         if not t or BAR_NUMBER.match(t):
@@ -183,19 +192,107 @@ def _row_tokens(row: list[dict],
         if not SCORE_CHARS.match(t):
             continue
         cleaned = _clean(t)
-        if cleaned:
-            cells.append((it["x0"], cleaned, count_beams(it, segments)))
-    cells.sort(key=lambda c: c[0])
-    return [{"ch": ch, "beams": b} for _x, s, b in cells for ch in s]
+        if not cleaned:
+            continue
+        x0 = float(it["x0"])
+        x1 = float(it["x1"])
+        n = len(cleaned)
+        cw = max(x1 - x0, n * 1.0) / n
+        for i, ch in enumerate(cleaned):
+            chars.append((x0 + (i + 0.5) * cw, ch, cw))
+    chars.sort(key=lambda c: c[0])
+    return chars
 
 
-def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[dict], int]:
-    """单张图 → 逐行落格后的 [{ch, beams}]，并统计有效行数。
+def _estimate_cell_width(xs: list[float]) -> float:
+    """估计单格宽度（相邻字符中心 = 1 格）。
+
+    谱面里组内字符是连续排列（间距恰好 = 1 格宽），组间因节拍留白更宽。
+    所以相邻间距的**低分位**就是真实格宽：取 15 分位，
+    既能落在连续区，又不会被个别贴得很近的误识别框拉偏。
+    """
+    diffs = sorted(b - a for a, b in zip(xs, xs[1:]) if b - a > 0.5)
+    if not diffs:
+        return 0.0
+    return diffs[min(len(diffs) - 1, int(len(diffs) * 0.15))]
+
+
+def _row_tokens(row: list[dict],
+                segments: list[tuple[float, float, float, int]]) -> list[dict]:
+    """一行文本框 → [{"slot": 行内格位 0..ROW_SLOTS-1, "ch": 字符, "beams": 条数}, ...]
+
+    **按坐标落格，不再按顺序拼接**（这是本函数与旧版的核心区别）：
+
+    旧版把每个文本框的字符按顺序首尾相接交给全局 cursor 累加。
+    两个致命后果：
+      1. OCR 漏读一个框 → 该行之后所有字符整体左移一格，
+         且 cursor 又把这个错位**传给下一行** → 整首错位；
+      2. 行内组间的节拍空隙被吞掉 → 休止消失、节奏拉长。
+
+    新版：
+      · 用行内相邻字符间距的低分位估计单格宽；
+      · 每个字符按 x 中心算出行内格位 slot = round((x - 行首x)/格宽)；
+      · 字符撞格时顺延到下一个空格（不丢字）；
+      · 超出 ROW_SLOTS 的字符丢弃（宁可本行少字，不能污染下一行）。
+    行与行之间由调用方按固定行宽对齐（见 image_to_tab），
+    错误不再跨行传播。
+    """
+    chars = _row_chars(row)
+    if not chars:
+        return []
+    xs = [c[0] for c in chars]
+    # 谱字符自身跨度：真实谱面行 ≥ 440px；指法图例（D1456789）、
+    # 竖排装饰等异物的谱字符挤在 <300px 里，直接丢弃。
+    # 注意必须用**谱字符**的跨度而不是整行 items 的跨度 ——
+    # 图例行常常和小节号等无关框被聚到同一行，整行跨度会虚高。
+    char_span = xs[-1] - xs[0]
+    cw_last = chars[-1][2]
+    if char_span + cw_last < MIN_ROW_SPAN:
+        return []
+    span = char_span
+    cell_w = _estimate_cell_width(xs)
+    if cell_w <= 0:
+        cell_w = max(1.0, span / max(1, len(chars)))
+
+    # 跨度归一：若按低分位格宽推出本行超过 ROW_SLOTS 格，
+    # 说明低分位估小了（组内间距 ≠ 格宽、或框内均分有系统偏差），
+    # 此时改用「整行 = ROW_SLOTS 格」反推格宽 —— 谱面物理上就是固定 32 格/行。
+    est_cells = span / cell_w + 1 if span > 0 else len(chars)
+    if est_cells > ROW_SLOTS and span > 0:
+        cell_w = span / (ROW_SLOTS - 1)
+
+    x_first = xs[0]
+    out: list[dict] = []
+    beams_of = [(it, count_beams(it, segments)) for it in row]
+    last_slot = -1
+    for x, ch, _cw in chars:
+        # 找到该字符所属的文本框，取它的符杠条数
+        beams = 0
+        for it, b in beams_of:
+            if float(it["x0"]) - 1.0 <= x <= float(it["x1"]) + 1.0:
+                beams = b
+                break
+        slot = int(round((x - x_first) / cell_w))
+        slot = max(0, slot)
+        if slot <= last_slot:
+            slot = last_slot + 1
+        if slot >= ROW_SLOTS:
+            break
+        out.append({"slot": slot, "ch": ch, "beams": beams})
+        last_slot = slot
+    return out
+
+
+def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list[dict]], int]:
+    """单张图 → 每个有效行的落格 tokens + 有效行数。
+
+    返回 rows_tokens: [[{slot, ch, beams}, ...], ...] —— 外层按行、
+    内层按行内格位。调用方按 ROW_SLOTS 给每行分配固定行宽。
 
     流程：
-      1. 识别（provider 内部是「分块 det + 2x 裁剪 rec」，峰值内存 ~316MB）
+      1. 识别（provider 内部是「分块 det + 裁剪 rec」，峰值内存 ~316MB）
       2. 在**原图**上独立检测所有横线段（符杠）——原图分辨率，细线不被抹掉
-      3. 逐行分组 + 按 x 归属符杠条数 → 落格
+      3. 逐行分组 + 按 x 落格（不再顺序拼接）
     """
     t0 = time.time()
     # 统一预处理：超大图先等比缩到 OCR_MAX_WIDTH。
@@ -213,15 +310,14 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[dict
         segments = []
 
     rows = _group_rows(items)
-    tokens: list[dict] = []
-    used_rows = 0
+    rows_tokens: list[list[dict]] = []
     for row in rows:
+        # 行内过滤在 _row_tokens 里做：按**谱字符跨度**滤掉图例等异物
         toks = _row_tokens(row, segments)
         if not toks:
             continue
-        used_rows += 1
-        # 不补位：时值由横线决定，补位会虚增格数、把节奏拉长
-        tokens.extend(toks)
+        rows_tokens.append(toks)
+    used_rows = len(rows_tokens)
     t2 = time.time()
 
     if timing is not None:
@@ -229,7 +325,7 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[dict
         # 这里不覆盖，只补齐缺失项。
         timing.setdefault("infer_ms", int((t1 - t0) * 1000))
         timing.setdefault("format_ms", int((t2 - t1) * 1000))
-    return tokens, used_rows
+    return rows_tokens, used_rows
 
 
 def image_to_tab(raw: bytes | list[bytes],
@@ -265,41 +361,47 @@ def image_to_tab(raw: bytes | list[bytes],
 
     t_fmt0 = time.time()
     for pi, page in enumerate(pages):
-        toks, rows = _page_tokens(page, timing)
+        rows_tokens, rows = _page_tokens(page, timing)
         total_rows += rows
-        if not toks:
+        if not rows_tokens:
             empty_pages += 1
             continue
-        if pi and cursor % SLOTS_PER_BAR:
-            # 每张图从整小节开始，避免跨图串拍
-            cursor += SLOTS_PER_BAR - cursor % SLOTS_PER_BAR
+        # 每张图从整行（2 小节）开始，避免跨图串拍
+        if cursor % ROW_SLOTS:
+            cursor += ROW_SLOTS - cursor % ROW_SLOTS
 
-        for tok in toks:
-            ch = tok["ch"]
-            beams = max(0, min(2, int(tok.get("beams") or 0)))
-            if ch == ".":
-                rests += 1
-                cursor += 1
-                continue
+        # ★ 行对齐落格：每行固定占 ROW_SLOTS 格，行内字符按 x 落到 slot。
+        #   一行无论读出多少字符，下一行永远从正确的行首开始 ——
+        #   OCR 漏读/误读只造成本行局部缺字，不再把错误传给整首歌。
+        #   行内组间空隙自然成为休止（没有字符的 slot 就没有事件）。
+        for toks in rows_tokens:
+            row_base = cursor
+            for tok in toks:
+                ch = tok["ch"]
+                beams = max(0, min(2, int(tok.get("beams") or 0)))
+                if ch == ".":
+                    rests += 1
+                    continue
 
-            beam_dist[beams] = beam_dist.get(beams, 0) + 1
-            dur = DUR_OF[beams]
-            start = round(cursor * sec_per_slot, 3)
-            cursor += dur
+                beam_dist[beams] = beam_dist.get(beams, 0) + 1
+                dur = DUR_OF[beams]
+                pos = row_base + int(tok.get("slot") or 0)
+                start = round(pos * sec_per_slot, 3)
 
-            if ch in "XxTtSs":
-                unpitched += 1
-                events.append({"start": start, "pitch": None, "kind": "stroke",
-                               "label": "S", "beams": beams, "dur": dur, "amp": 0.8})
-                continue
-            if ch in "Dd":
-                events.append({"start": start, "pitch": 50, "kind": "ding",
-                               "label": "D", "beams": beams, "dur": dur, "amp": 0.9})
-                continue
-            midi = midi_of.get(int(ch)) if ch.isdigit() else None
-            if midi is not None:
-                events.append({"start": start, "pitch": midi,
-                               "beams": beams, "dur": dur, "amp": 0.9})
+                if ch in "XxTtSs":
+                    unpitched += 1
+                    events.append({"start": start, "pitch": None, "kind": "stroke",
+                                   "label": "S", "beams": beams, "dur": dur, "amp": 0.8})
+                    continue
+                if ch in "Dd":
+                    events.append({"start": start, "pitch": 50, "kind": "ding",
+                                   "label": "D", "beams": beams, "dur": dur, "amp": 0.9})
+                    continue
+                midi = midi_of.get(int(ch)) if ch.isdigit() else None
+                if midi is not None:
+                    events.append({"start": start, "pitch": midi,
+                                   "beams": beams, "dur": dur, "amp": 0.9})
+            cursor = row_base + ROW_SLOTS
 
     if not events:
         out = {
