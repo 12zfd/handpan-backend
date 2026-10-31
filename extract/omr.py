@@ -264,6 +264,46 @@ def _detect_two_column(items: list[dict]) -> bool:
     return big >= 4
 
 
+def _is_polluted_row(items: list[dict]) -> bool:
+    """判定一行文本框是否被 OCR **连同下划线读成整行乱码**。
+
+    为什么要判这个（实测 44/45 张历史图都中招，每张 1~2 行）：
+      谱面里「双下划线」的小节会让 OCR 把下划线当成字符并吞进同一个框。
+      实测 bfadb43f 的 y=827：
+          x0=117 x1=385  'DxxDxxTxTxxDxxDx'   ← 268px / 15 字符
+          x0=407 x1=677  'DxxDxxDxxDxxDxxD'   ← 270px / 15 字符
+      原图这一行其实是 `DxxD xxTx TxxD xxDx | DxxD xxDx xDxx DxxD`，
+      15 个字符里约 5 个是下划线变的。按正常逻辑会产出 30 个假音符，
+      该小节整段变噪音 —— 这是「音节对不上」里最刺耳的一类。
+
+    判据（三条同时满足，实测对正常行零误伤）：
+      1. 框数 <= 3        正常谱面行 6~9 个框
+      2. 平均框内 >= 6 字  正常框 3~4 字
+      3. 主导字符占比 >= 60% 正常行 D/T/X 混合，不可能单字符刷屏
+
+    ⚠️ 第 1 条必需：实测 ca1b5cb7 的 y=1966 也是「4 框 / 32 字 / 平均 8 /
+       X 占 22」，但原图确实是疏排的 `D x x x T x x D x x D x T x x x`，
+       属正常行。区别就在框数：正常疏排 4 框，污染行只塌成 2 框。
+    """
+    texts = []
+    for it in items:
+        t = "".join(ch for ch in str(it.get("text", "")).replace(" ", "")
+                    if ch in "DXxTtSs123456789")
+        if t:
+            texts.append(t)
+    if not texts:
+        return False
+    n_box = len(texts)
+    n_ch = sum(len(t) for t in texts)
+    if n_box > 3 or n_ch < 8:
+        return False
+    if n_ch / n_box < 6.0:
+        return False
+    joined = "".join(texts)
+    top = max(joined.count(c) for c in set(joined))
+    return top / n_ch >= 0.6
+
+
 def _group_rows(items: list[dict]) -> list[list[dict]]:
     if not items:
         return []
@@ -285,6 +325,9 @@ def _group_rows(items: list[dict]) -> list[list[dict]]:
 
 # 最近一次 _page_tokens 是否判定为双栏（供 image_to_tab 拼告警文案）
 _LAST_TWO_COLUMN = False
+
+# 最近一次 image_to_tab 累计清空的「污染行」数（供告警文案）
+_LAST_DROPPED_ROWS = 0
 
 
 def _clean(text: str) -> str:
@@ -609,6 +652,24 @@ def _column_tokens(col: list[dict],
     for row, chars in zip(rows, rows_chars):
         if not chars:
             continue
+        # ── 污染行：整行清空，只**保留占位**
+        # 污染行里的字符有一部分是下划线变的（实测 32 字符里约 10 个），
+        # 字符本身已经错了，无论怎么裁都拼不回原谱。实测裁剪后仍得到
+        # `DxxDxxTxTxx·DxxDxxDxxDx`，而原图是
+        # `DxxD xxTx TxxD xxDx | DxxD xxDx xDxx DxxD` —— 组边界全错。
+        # 所以整行不放音符，宁可缺一拍（明显、可补录），也不要输出
+        # 一串听着像噪音的假音（刺耳、且用户不知道该改哪里）。
+        #
+        # ⚠️ 但必须推一个空列表进去占住位置：直接跳过会让后面所有行
+        #    整体前移一行，小节划分全漂（实测 63 小节 → 73 小节）。
+        # ⚠️ 只在最后这一步处理，格宽/左边界估计**照旧让它参与**：
+        #    实测把它从格宽中位数里摘出去，中位数 24.2→25.0，
+        #    反而让原本正确的 5 行发生退化。
+        if _is_polluted_row(row):
+            global _LAST_DROPPED_ROWS
+            _LAST_DROPPED_ROWS += 1
+            out_rows.append([])
+            continue
         toks = _row_tokens(row, segments, cell_w_hint=cell_w_hint,
                            left_hint=left_hint, chars=chars)
         if toks:
@@ -690,6 +751,10 @@ def image_to_tab(raw: bytes | list[bytes],
     unpitched = 0
     empty_pages = 0
 
+    # 每次调用重置污染行计数（多页时跨页累加）
+    global _LAST_DROPPED_ROWS
+    _LAST_DROPPED_ROWS = 0
+
     t_fmt0 = time.time()
     for pi, page in enumerate(pages):
         rows_tokens, rows = _page_tokens(page, timing)
@@ -759,6 +824,11 @@ def image_to_tab(raw: bytes | list[bytes],
             "这张图是双栏排版（左右两栏谱面并排）。双栏图的字符顺序在 OCR "
             "阶段就是跨栏交错的，自动还原会把音节错位。请改为单栏截图 "
             "（一次只截一栏），或把图旋转/裁成单栏后再传。")
+    if _LAST_DROPPED_ROWS:
+        warnings.append(
+            f"有 {_LAST_DROPPED_ROWS} 行被 OCR 连同下划线读成了乱码"
+            "（整行塌成两个大框、一串 x 刷屏），已清空该行内容但保留其"
+            "节拍位置。这些行需要对照原图补录，否则会缺几拍。")
     if beam_dist[1] + beam_dist[2]:
         warnings.append(f"符杠：一条 {beam_dist[1]} 个、两条 {beam_dist[2]} 个")
     else:
