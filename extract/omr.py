@@ -389,12 +389,40 @@ def _row_chars(row: list[dict],
         #      四舍五入后整组右移一格 —— 实测 y=650 因此变成
         #      '2X·XTXXD'（本该 '2XX·TXXD'）。用格宽推进才对齐。
         span = x1 - x0
+        # ── 【音节不对齐 · 最强根因】OCR 漏掉组间空格，把 2~4 个四元组
+        # 读成一串，中间的空格全丢：
+        #     'DxxD xxTx TxxD xxDx'  →  'DxxDxxTxTxxDxxDx'
+        # 一组被并成一串后，字符只能均匀铺开，组边界彻底消失，
+        # 落格出来就是 `DxxDxxTxTxxDxxDx` 这种 16 个字符挤一起、整行读不出音节。
+        #
+        # 判据（四条同时成立，45 张历史样本实测零误伤）：
+        #   1) 字符数 >= 8 且能被 4 整除（谱面每组恒 4 字符）
+        #   2) 框宽/字符数 >= 0.55 格 —— 装得下 4 字符一组。
+        #      真·密集连打是 0.25~0.3 格/字，不会被这条放进来；
+        #      而实测的合并串是 0.66~0.75 格/字（如 274px/16 字 = 0.70）。
+        #   3) 明显比「按格宽排满」窄：span < cell_w * n * 0.9。
+        #      正常 4 字符框是 1.0 格/字（'TXXD' 105px/4），不会误伤。
+        #   4) 去掉首字符后不再以 D/T/S 开头 —— 合并串中间一定有组首字符。
+        #      例：'DxxDxxTx' 去首 → 'xxDxxTx'，不再以 D/T/S 开头 → 合并。
+        #          'DxxDxxx'  去首 → 'xxDxxx'  开头的 x 之后还有 D，但位置
+        #          不是 4 的倍数，属于框内噪点，不算合并。
+        if (n >= 8 and n % 4 == 0 and cell_w and cell_w > 0
+                and (span / n) >= cell_w * 0.55
+                and span < cell_w * n * 0.9):
+            # 按 4 字符一组切开，每组左端对齐到自己的 x 起点 + 半格
+            for g0 in range(0, n, 4):
+                grp = cleaned[g0:g0 + 4]
+                gx0 = x0 + span * g0 / float(n)
+                gcx0 = gx0 + cell_w / 2.0
+                for i, ch in enumerate(grp):
+                    chars.append((gcx0 + i * cell_w, ch, cell_w))
+            continue
         if not (cell_w and cell_w > 0):
             pitch = span / n if n else 1.0
         elif span > cell_w * n * 1.3:
             pitch = span / n          # 合并框
         elif span < cell_w * n * 0.78:
-            pitch = span / n          # 密集连打
+            pitch = span / n          # 真密集连打（一拍四音）
         else:
             pitch = cell_w            # 正常单组：左端锚定 + 格宽
         cx0 = x0 + pitch / 2.0
