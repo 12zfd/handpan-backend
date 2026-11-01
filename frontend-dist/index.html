@@ -731,6 +731,7 @@ var S = {
   rows: [],
   notice: null,
   loadFailed: false,
+  retryStopped: false,
   busy: false,
   dragging: false,
   openId: null,
@@ -1014,6 +1015,7 @@ async function loadHistory(){
   try{
     S.rows = await api.history();
     S.loadFailed = false;
+    S.retryStopped = false;
     renderRows();
     if(S.notice && S.notice.type === 'err') setNotice(null);
   }catch(e){
@@ -1034,7 +1036,9 @@ function renderRows(){
     : '';
 
   if(!S.rows.length){
-    box.innerHTML = '<div class="empty">'+(S.loadFailed?'加载失败，正在重试…':'还没有任务，先上传一个')+'</div>';
+    var _msg = S.retryStopped ? '加载失败，已停止自动重试，请刷新页面'
+             : (S.loadFailed ? '加载失败，正在重试…' : '还没有任务，先上传一个');
+    box.innerHTML = '<div class="empty">'+_msg+'</div>';
     return;
   }
   box.innerHTML = S.rows.map(function(r){
@@ -1106,23 +1110,51 @@ async function downloadRow(id){
 /* ------------------------------------------------------------------ 轮询 */
 var pollTimer = null, failTimer = null, verTimer = null, verBase = null;
 
-function startPolling(){
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(function(){
-    if(!S.rows.some(function(r){ return ACTIVE.indexOf(r.status) >= 0; })) return;
-    loadHistory();
-  }, 2500);
+/* 轮询保护：任务卡死时不能让轮询无限跑下去。
+   每轮都要连一次数据库 → 等于把 Neon compute 永远吊在运行状态，
+   CU-hours 照烧不误；而且出网流量也在涨。
+   规则：
+     1) 任务超过 12 分钟还没结束 → 轮询间隔从 2.5s 降到 15s；
+     2) 连续加载失败 → 退避 5s→10s→…→30s，连败 12 次就彻底停手。 */
+var POLL_SLOW_AFTER_MS = 12 * 60 * 1000;
+var failCount = 0;
 
-  if(failTimer) clearInterval(failTimer);
-  failTimer = setInterval(function(){
-    if(!S.loadFailed) return;
+function hasStuckActive(){
+  var now = Date.now();
+  return S.rows.some(function(r){
+    if(ACTIVE.indexOf(r.status) < 0) return false;
+    var t = Date.parse(r.created_at);
+    return !isNaN(t) && (now - t) > POLL_SLOW_AFTER_MS;
+  });
+}
+
+function startPolling(){
+  if(pollTimer) clearTimeout(pollTimer);
+  function pollTick(){
+    if(!S.rows.some(function(r){ return ACTIVE.indexOf(r.status) >= 0; })){
+      pollTimer = setTimeout(pollTick, 2500);
+      return;
+    }
     loadHistory();
-  }, 5000);
+    var delay = hasStuckActive() ? 15000 : 2500;
+    pollTimer = setTimeout(pollTick, delay);
+  }
+  pollTimer = setTimeout(pollTick, 2500);
+
+  if(failTimer) clearTimeout(failTimer);
+  function failTick(){
+    if(!S.loadFailed){ failCount = 0; S.retryStopped = false; return; }
+    if(failCount >= 12){ S.retryStopped = true; renderRows(); return; }
+    failCount++;
+    loadHistory();
+    failTimer = setTimeout(failTick, Math.min(5000 * failCount, 30000));
+  }
+  failTimer = setTimeout(failTick, 5000);
 }
 
 function stopPolling(){
-  if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
-  if(failTimer){ clearInterval(failTimer); failTimer = null; }
+  if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
+  if(failTimer){ clearTimeout(failTimer); failTimer = null; }
   if(verTimer){ clearInterval(verTimer); verTimer = null; }
 }
 
