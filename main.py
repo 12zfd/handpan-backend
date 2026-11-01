@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm.attributes import flag_modified
 
 from database import get_db, init_db
 from database import SQLITE_PATH, db_backend, db_last_error, fallback_to_sqlite, is_fallback
@@ -471,6 +472,22 @@ def convert(
     return {"score_id": score_id, "status": "extracting"}
 
 
+# ------------------------------------------------------------------ JSON 写入
+def _write_json(db: Session, s: Score, payload: dict) -> None:
+    """写 `midi_data_json`（JSON 列）并显式标脏。
+
+    SQLAlchemy 判定 JSON 列「变没变」用的是**值相等比较**，而不是对象身份。
+    只要我们持有的还是同一个 dict 引用并原地改它，旧值快照会被同步污染，
+    两者永远相等 → 永不判脏 → 字段**静默丢失**（实测 render_ms / total_ms
+    就是这么消失的）。换成新 dict 也救不了：值仍然相等。
+
+    正解是 `flag_modified`（实测有效）。
+    `MutableDict` 也不行 —— 它只追踪顶层 key 变化，嵌套 dict 改动照样丢。
+    """
+    s.midi_data_json = payload
+    flag_modified(s, "midi_data_json")
+
+
 # ------------------------------------------------------------------ 历史 / 详情
 def _to_out(s: Score) -> ScoreOut:
     return ScoreOut(
@@ -538,7 +555,7 @@ def save_notes(
     else:
         payload["warnings"] = [w for w in (payload.get("warnings") or []) if "手动录入" not in w and "谱面为空" not in w]
 
-    s.midi_data_json = payload
+    _write_json(db, s, payload)
     s.status = "rendering"
     db.commit()
 
@@ -569,7 +586,7 @@ def rename_score(
     if s.midi_data_json:
         j = dict(s.midi_data_json)
         j["title"] = name
-        s.midi_data_json = j
+        _write_json(db, s, j)
         s.status = "rendering"
         db.commit()
         background.add_task(render_only, score_id)
@@ -604,15 +621,15 @@ def set_tempo(
         rebuilt = requantize(s.midi_data_json, body.bpm)
     except ValueError as exc:
         # 没有 raw 时间戳（例如纯手动录入的谱），只改页眉速度，不重排
-        s.midi_data_json = {**s.midi_data_json,
-                            "tempo": {**(s.midi_data_json.get("tempo") or {}), "bpm": body.bpm}}
+        _write_json(db, s, {**s.midi_data_json,
+                             "tempo": {**(s.midi_data_json.get("tempo") or {}), "bpm": body.bpm}})
         s.status = "rendering"
         db.commit()
         background.add_task(render_only, score_id)
         return {"score_id": score_id, "status": "rendering",
                 "bars": len(s.midi_data_json.get("bars") or []), "note": str(exc)}
 
-    s.midi_data_json = rebuilt
+    _write_json(db, s, rebuilt)
     s.status = "rendering"
     db.commit()
 
