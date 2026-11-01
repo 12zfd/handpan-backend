@@ -38,7 +38,19 @@ DATABASE_URL = _normalize(
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    _kwargs: dict = dict(pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=1800)
+    _kwargs: dict = dict(
+        pool_pre_ping=True,
+        # ★ 连接池水位直接决定 Neon 的 CU-hours 消耗速度。
+        # Neon 免费版每项目每月只有 100 CU-hours，compute 必须「5 分钟无连接」才缩到零。
+        # 池里闲置的长连接会一直吊着 compute 不缩零 → compute 整天在跑 → 月底必然
+        # 撞上 "Your account or project has exceeded the quota"。
+        # 单实例 + 低流量场景不需要大池子，pool_size=1 就够。
+        pool_size=int(os.environ.get("DB_POOL_SIZE", "1")),
+        max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "2")),
+        # recycle 必须 ≤ Neon 的 5 分钟缩零窗口，否则连接一直吊着 compute
+        pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "240")),
+        pool_timeout=15,
+    )
     # Render 免费容器没有 IPv6 出网，而 Neon 域名是双栈解析；
     # 显式解析一个 IPv4 交给 psycopg（host 仍用于 TLS 证书校验），避免 it 只试 IPv6 而失败。
     try:
@@ -51,6 +63,10 @@ else:
     engine = create_engine(DATABASE_URL, **_kwargs)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+# 当前实际使用的后端类型（sqlite / postgres），供 /healthz 与启动日志报告
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+SQLITE_PATH = DATA_DIR / "handpan.db"
 
 
 def init_db() -> None:
