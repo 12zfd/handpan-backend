@@ -42,11 +42,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from database import IS_SQLITE, SQLITE_PATH
+from database import SQLITE_PATH, db_backend, fallback_to_sqlite, is_fallback
 from models import Score, User
 from pipeline import render_only, run_pipeline
 from score.note_mapper import requantize
-from security import decode_token, make_token, verify_password
+from security import decode_token, hash_password, make_token, verify_password
 from storage import dump_keys, download_bytes, local_path, parse_keys, presign_get, upload_bytes
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -97,11 +97,18 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     code = "internal_error"
     text = str(exc).lower()
     if "exceeded the quota" in text or "too many connections" in text:
-        detail = "数据库配额或连接数已超限，请稍后重试（服务端数据库额度用尽）"
+        detail = "数据库配额已用尽，已临时切换到本地数据库（历史记录暂不可见）"
         code = "db_quota_exceeded"
     elif "operationalerror" in text or "connection" in text:
-        detail = "数据库暂时不可用，请稍后重试"
+        detail = "数据库暂时不可用，已临时切换到本地数据库（历史记录暂不可见）"
         code = "db_unavailable"
+
+    # 数据库类故障 → 立刻降级到 SQLite，让后续请求能正常走通
+    if code in ("db_quota_exceeded", "db_unavailable"):
+        try:
+            fallback_to_sqlite(str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            pass
 
     resp = JSONResponse(status_code=500, content={"detail": detail, "code": code})
     origin = request.headers.get("origin")
@@ -117,12 +124,16 @@ def _startup() -> None:
     # 数据库连不上（配额超限 / 临时不可用）时不能让整个容器起不来，
     # 否则连 /healthz 都探不到，完全没法自愈和诊断。
     log = logging.getLogger("handpan.startup")
-    log.info("数据库后端: %s%s", "sqlite" if IS_SQLITE else "postgres",
-             f" ({SQLITE_PATH})" if IS_SQLITE else "")
+    log.info("数据库后端: %s", db_backend())
     try:
         init_db()
+        log.info("数据库就绪: %s", db_backend())
     except Exception as exc:  # noqa: BLE001
-        log.error("数据库初始化失败（服务仍启动）: %s", exc)
+        log.error("Postgres 初始化失败，尝试降级到 SQLite: %s", exc)
+        if fallback_to_sqlite(str(exc)[:200]):
+            log.warning("已降级到 SQLite: %s", SQLITE_PATH)
+        else:
+            log.error("降级失败，服务将在每次请求时重试")
 
 
 @app.middleware("http")
@@ -221,9 +232,45 @@ def current_user_from_header_or_query(
     return user
 
 
+def _fallback_creds() -> dict[str, str]:
+    """降级到 SQLite 后的应急账号表。
+
+    格式：FALLBACK_USERS="用户名:密码,用户名2:密码2"
+    在 Render 环境变量里配置；未配置则不启用应急登录。
+    """
+    raw = os.environ.get("FALLBACK_USERS", "")
+    out: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if ":" in item:
+            u, p = item.split(":", 1)
+            if u.strip() and p.strip():
+                out[u.strip()] = p.strip()
+    return out
+
+
+def _ensure_fallback_user(db: Session, username: str, password: str) -> User | None:
+    """在降级用的 SQLite 里建一个账号（仅在配置了 FALLBACK_USERS 时调用）。"""
+    try:
+        user = User(username=username, password=hash_password(password))
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("handpan.login").error("创建降级账号失败: %s", exc)
+        db.rollback()
+        return None
+
+
 @app.post("/login", response_model=TokenOut)
 def login(body: LoginIn, db: Annotated[Session, Depends(get_db)]):
     user = db.scalar(select(User).where(User.username == body.username))
+    if user is None and is_fallback():
+        # 降级到 SQLite 后 users 表是空的。用环境变量里的应急账号兜底，
+        # 保证「Neon 挂了」不会变成「谁都登不进来」。
+        if _fallback_creds().get(body.username) == body.password:
+            user = _ensure_fallback_user(db, body.username, body.password)
     if user is None or not verify_password(body.password, user.password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号或密码错误")
     return TokenOut(access_token=make_token(user.id, user.username), username=user.username)
@@ -641,9 +688,11 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
     之前 /healthz 完全不碰数据库，所以数据库挂掉时它仍返回 200，
     表现为「服务活着但所有功能全挂」，很难第一时间发现问题。
     """
-    out: dict = {"ok": True, "ts": int(time.time()), "db_backend": "sqlite" if IS_SQLITE else "postgres"}
-    if IS_SQLITE:
+    out: dict = {"ok": True, "ts": int(time.time()), "db_backend": db_backend()}
+    if is_fallback():
+        out["db_fallback"] = True
         out["db_file"] = str(SQLITE_PATH)
+        out["note"] = "Postgres 不可用，已降级到本地 SQLite（历史记录暂不可见）"
     if deep:
         try:
             db = next(get_db())

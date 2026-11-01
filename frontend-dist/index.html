@@ -31,6 +31,10 @@ input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .foot-note{margin-top:20px;text-align:center;font-size:12px;line-height:1.7;color:#475569}
 
+/* ---------- 数据库降级横幅 ---------- */
+.dbbanner{padding:9px 20px;background:rgba(180,83,9,.16);border-bottom:1px solid rgba(217,119,6,.38);color:#FCD34D;font-size:12.5px;line-height:1.6}
+@media (max-width:640px){ .dbbanner{padding:9px 14px;font-size:11.5px} }
+
 /* ---------- 顶栏 ---------- */
 .topbar{position:sticky;top:0;z-index:20;height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid #1A2432;background:rgba(18,24,33,.82);backdrop-filter:blur(8px)}
 .topbar-l{display:flex;align-items:center;gap:10px}
@@ -610,6 +614,10 @@ function diagnoseBackend(){
     .then(function(res){ return res.json().catch(function(){ return null; }); })
     .then(function(b){
       if(!b) return '连不上后端服务（网络不通或后端未启动）';
+      if(b.db_fallback){
+        return '主数据库暂时不可用，后端已自动切换到本地应急数据库。'
+             + '可以正常新建和下载，但历史记录暂不可见。';
+      }
       if(b.db === 'unavailable'){
         return '后端服务在运行，但数据库不可用：' + (b.error || '未知原因');
       }
@@ -726,7 +734,8 @@ var S = {
   dragging: false,
   openId: null,
   preview: null,
-  stale: false
+  stale: false,
+  dbFallback: false
 };
 
 /* ------------------------------------------------------------------ 提示条 */
@@ -812,6 +821,7 @@ function renderLogin(){
       setAuth(res.access_token, res.username);
       S.user = res.username;
       renderApp();
+      checkDbFallback();
     }).catch(function(e){
       errBox.textContent = e.message; errBox.classList.remove('hide');
       // 网络类错误多见于跨域被拦，额外给出定位指引
@@ -828,9 +838,34 @@ function renderLogin(){
 }
 
 /* ------------------------------------------------------------------ 主界面 */
+function checkDbFallback(){
+  /* 后端主库挂掉时会自动降级到本地 SQLite，此时界面要明确告知用户
+     「能用，但历史记录看不到」，而不是让它看起来像正常状态。 */
+  return fetch(apiUrl('/healthz?deep=1'), {method:'GET', cache:'no-store'})
+    .then(function(res){ return res.json().catch(function(){ return null; }); })
+    .then(function(b){
+      if(b && b.db_fallback && !S.dbFallback){
+        S.dbFallback = true;
+        var bar = document.createElement('div');
+        bar.className = 'dbbanner';
+        bar.textContent = '主数据库暂时不可用，已自动切换到本地应急数据库：'
+          + '可以正常新建与下载，但历史记录暂不可见。';
+        var app = document.getElementById('app');
+        if(app) app.insertBefore(bar, app.firstChild);
+      }
+      return b;
+    })
+    .catch(function(){ return null; });
+}
+
 function renderApp(){
   var initials = (S.user || '?').slice(0,1).toUpperCase();
+  var dbBanner = S.dbFallback
+    ? '<div class="dbbanner">主数据库暂时不可用，已自动切换到本地应急数据库：'
+      + '可以正常新建与下载，但历史记录暂不可见。</div>'
+    : '';
   $('app').innerHTML =
+    dbBanner+
     '<header class="topbar">'+
       '<div class="topbar-l">'+LOGO_SVG+
         '<span class="topbar-t">手碟谱面统一转换</span>'+
