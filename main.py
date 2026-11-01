@@ -42,6 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
+from database import IS_SQLITE, SQLITE_PATH
 from models import Score, User
 from pipeline import render_only, run_pipeline
 from score.note_mapper import requantize
@@ -115,10 +116,13 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 def _startup() -> None:
     # 数据库连不上（配额超限 / 临时不可用）时不能让整个容器起不来，
     # 否则连 /healthz 都探不到，完全没法自愈和诊断。
+    log = logging.getLogger("handpan.startup")
+    log.info("数据库后端: %s%s", "sqlite" if IS_SQLITE else "postgres",
+             f" ({SQLITE_PATH})" if IS_SQLITE else "")
     try:
         init_db()
     except Exception as exc:  # noqa: BLE001
-        logging.getLogger("handpan.startup").error("数据库初始化失败（服务仍启动）: %s", exc)
+        log.error("数据库初始化失败（服务仍启动）: %s", exc)
 
 
 @app.middleware("http")
@@ -637,7 +641,9 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
     之前 /healthz 完全不碰数据库，所以数据库挂掉时它仍返回 200，
     表现为「服务活着但所有功能全挂」，很难第一时间发现问题。
     """
-    out: dict = {"ok": True, "ts": int(time.time())}
+    out: dict = {"ok": True, "ts": int(time.time()), "db_backend": "sqlite" if IS_SQLITE else "postgres"}
+    if IS_SQLITE:
+        out["db_file"] = str(SQLITE_PATH)
     if deep:
         try:
             db = next(get_db())
