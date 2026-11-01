@@ -692,7 +692,14 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
     if is_fallback():
         out["db_fallback"] = True
         out["db_file"] = str(SQLITE_PATH)
-        out["note"] = "Postgres 不可用，已降级到本地 SQLite（历史记录暂不可见）"
+        # 落在容器临时盘上 → 容器重启后这份 SQLite 会丢（Render 免费版没有持久盘，
+        # /var/data 不存在时会回落到代码目录）。必须让用户看得见。
+        out["db_persistent"] = str(SQLITE_PATH).startswith("/var/data")
+        out["note"] = (
+            "Postgres 不可用，已降级到本地 SQLite（历史记录暂不可见）"
+            if out["db_persistent"] else
+            "Postgres 不可用，已降级到本地 SQLite；注意当前容器无持久盘，重启后本次降级数据会丢失"
+        )
     if deep:
         try:
             db = next(get_db())
