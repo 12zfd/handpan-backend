@@ -18,8 +18,31 @@ from sqlalchemy.orm import sessionmaker
 from models import Base
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_data_dir() -> Path:
+    """定位数据目录，优先级：
+    1. 环境变量 DATA_DIR（Render 显式配置，最权威）
+    2. /var/data —— Render 持久盘的标准挂载点，存在即用
+    3. 代码目录下的 data/（本地开发兜底）
+
+    第 2 条很重要：Render 上如果 DATA_DIR 没配好，写到容器临时盘会导致
+    容器一重启 SQLite 文件就没了（数据丢失）。
+    """
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return Path(env)
+    for candidate in (Path("/var/data"),):
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            pass
+    return BASE_DIR / "data"
+
+
 # 与 storage 共用 DATA_DIR：挂载 Render Disk 后，SQLite 也落在持久盘上
-DATA_DIR = Path(os.environ.get("DATA_DIR") or (BASE_DIR / "data"))
+DATA_DIR = _resolve_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 

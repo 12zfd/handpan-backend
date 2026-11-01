@@ -14,7 +14,20 @@ from urllib.parse import quote
 BASE_DIR = Path(__file__).resolve().parent
 # 生产环境把 DATA_DIR 指向 Render Disk 的挂载点（如 /var/data），
 # 否则容器重启后上传件和 PDF 会全部丢失（Render 的容器盘是临时的）。
-LOCAL_ROOT = Path(os.environ.get("DATA_DIR") or (BASE_DIR / "data"))
+# 与 database.py 用同一套解析逻辑，保证上传件和 SQLite 落在同一个目录。
+def _resolve_local_root() -> Path:
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return Path(env)
+    try:
+        if Path("/var/data").is_dir():
+            return Path("/var/data")
+    except OSError:
+        pass
+    return BASE_DIR / "data"
+
+
+LOCAL_ROOT = _resolve_local_root()
 BUCKET = os.environ.get("S3_BUCKET", "")
 
 
