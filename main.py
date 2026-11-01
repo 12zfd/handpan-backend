@@ -39,10 +39,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from database import get_db, init_db
-from database import SQLITE_PATH, db_backend, fallback_to_sqlite, is_fallback
+from database import SQLITE_PATH, db_backend, db_last_error, fallback_to_sqlite, is_fallback
 from models import Score, User
 from pipeline import render_only, run_pipeline
 from score.note_mapper import requantize
@@ -422,8 +422,18 @@ def task_status(
     user: Annotated[User, Depends(current_user)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    """轮询任务进度。task_id 与 score_id 是同一个 id（不新增数据表）。"""
-    s = db.get(Score, task_id)
+    """轮询任务进度。task_id 与 score_id 是同一个 id（不新增数据表）。
+
+    只 SELECT 用得到的列：midi_data_json 是大字段，整行取出来再丢掉，
+    出网流量照样按「Neon → 应用」的字节计 —— 前端 2.5s 轮询一次，
+    几分钟就能把一个月的免费出网额度烧穿。
+    """
+    s = db.scalars(
+        select(Score).options(load_only(
+            Score.id, Score.status, Score.error_message,
+            Score.pdf_url, Score.created_at, Score.updated_at,
+        )).where(Score.id == task_id)
+    ).first()
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
     return TaskOut(
@@ -476,7 +486,14 @@ def history(
     db: Annotated[Session, Depends(get_db)],
     limit: int = Query(50, ge=1, le=200),
 ):
-    rows = db.scalars(select(Score).order_by(Score.created_at.desc()).limit(limit)).all()
+    # load_only：只要这 8 个轻字段。midi_data_json 不取 ——
+    # 出网流量按字节计，「取出来再丢掉」一样烧额度（Neon 免费版每月出网额度有限）。
+    rows = db.scalars(
+        select(Score).options(load_only(
+            Score.id, Score.title, Score.source_type, Score.status,
+            Score.error_message, Score.pdf_url, Score.created_at, Score.updated_at,
+        )).order_by(Score.created_at.desc()).limit(limit)
+    ).all()
     return [_to_out(s) for s in rows]
 
 
@@ -689,6 +706,11 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
     表现为「服务活着但所有功能全挂」，很难第一时间发现问题。
     """
     out: dict = {"ok": True, "ts": int(time.time()), "db_backend": db_backend()}
+    _err = db_last_error()
+    if _err:
+        # 最近一次 Postgres 故障原文：配额超限 / 出网额度用尽 / 连不上 / 认证失败。
+        # 没有这一项就只能看到「已降级」，无法判断该怎么处置。
+        out["db_error"] = _err
     if is_fallback():
         out["db_fallback"] = True
         out["db_file"] = str(SQLITE_PATH)

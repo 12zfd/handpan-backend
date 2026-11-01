@@ -14,6 +14,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from models import Base
 
@@ -62,19 +63,19 @@ DATABASE_URL = _normalize(
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    _kwargs: dict = dict(
-        pool_pre_ping=True,
-        # ★ 连接池水位直接决定 Neon 的 CU-hours 消耗速度。
-        # Neon 免费版每项目每月只有 100 CU-hours，compute 必须「5 分钟无连接」才缩到零。
-        # 池里闲置的长连接会一直吊着 compute 不缩零 → compute 整天在跑 → 月底必然
-        # 撞上 "Your account or project has exceeded the quota"。
-        # 单实例 + 低流量场景不需要大池子，pool_size=1 就够。
-        pool_size=int(os.environ.get("DB_POOL_SIZE", "1")),
-        max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "2")),
-        # recycle 必须 ≤ Neon 的 5 分钟缩零窗口，否则连接一直吊着 compute
-        pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "240")),
-        pool_timeout=15,
-    )
+    # ★★ Neon 的 CU-hours 与出网流量，全都取决于「连接被怎么持有」★★
+    #
+    # 坑 1（CU-hours）：SQLAlchemy 的 pool_recycle 只在「取连接时」判定过期，
+    #   池里那条启动时开的空闲连接永远不会被回收 —— 它被永久持有；
+    #   Neon 只要看到还有连接在，就不会把 compute 缩到零，compute 24 小时在跑，
+    #   100 CU-hours 的免费额度 4 天就烧光，之后整个月都是 "exceeded the quota"。
+    #   → 改用 NullPool：连接用完即关，绝不留空闲连接。
+    #   （Session 在一个事务内始终复用同一条连接，所以每请求只开 1 次连接，
+    #     get_db 里那次探活 select(1) 不额外开连接。）
+    #
+    # 坑 2（出网流量）：出网字节按「Neon → 应用」计，取出来又丢掉的字段照样计费。
+    #   → 见 main.py 里 /history、/tasks/{id} 的 load_only()。
+    _kwargs: dict = dict(poolclass=NullPool)
     # Render 免费容器没有 IPv6 出网，而 Neon 域名是双栈解析；
     # 显式解析一个 IPv4 交给 psycopg（host 仍用于 TLS 证书校验），避免 it 只试 IPv6 而失败。
     try:
@@ -95,7 +96,8 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 # 当前实际使用的后端类型（sqlite / postgres），供 /healthz 与启动日志报告
 SQLITE_PATH = DATA_DIR / "handpan.db"
 # 降级后为 True。做成可变而非常量，因为 Postgres 配额爆掉时可能中途切到 SQLite。
-_state = {"sqlite": DATABASE_URL.startswith("sqlite"), "fallback": False}
+_state = {"sqlite": DATABASE_URL.startswith("sqlite"), "fallback": False,
+          "last_error": ""}
 
 
 def db_backend() -> str:
@@ -106,6 +108,15 @@ def db_backend() -> str:
 def is_fallback() -> bool:
     """是否处于「Postgres 不可用 → 降级到 SQLite」的应急状态。"""
     return _state["fallback"]
+
+
+def db_last_error() -> str:
+    """最近一次数据库故障的原文（空字符串 = 没有记录过故障）。
+
+    为什么需要它：只看到「已降级」是没法处置的 —— 配额超限、出网额度用尽、
+    连不上、认证失败，四种根因的处理方式完全不同，必须把原文暴露出来。
+    """
+    return _state["last_error"]
 
 
 def init_db() -> None:
@@ -133,6 +144,7 @@ def fallback_to_sqlite(reason: str = "") -> bool:
     SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     _state["sqlite"] = True
     _state["fallback"] = True
+    _state["last_error"] = reason[:300]
     try:
         Base.metadata.create_all(engine)
     except Exception as exc:  # noqa: BLE001
@@ -155,6 +167,7 @@ def get_db():
             db.execute(select(1))
         except Exception as exc:  # noqa: BLE001
             db.close()
+            _state["last_error"] = str(exc)[:300]
             if not fallback_to_sqlite(str(exc)[:200]):
                 raise
             db = SessionLocal()
