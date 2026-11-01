@@ -6,11 +6,12 @@ Render 生产：配置 DATABASE_URL（Internal Database URL）即切到 PostgreS
 """
 from __future__ import annotations
 
+import logging
 import os
 import socket
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
@@ -57,7 +58,11 @@ else:
         _host = make_url(DATABASE_URL).host
         _infos = socket.getaddrinfo(_host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
         if _infos:
-            _kwargs["connect_args"] = {"hostaddr": _infos[0][4][0]}
+            _ca = {"hostaddr": _infos[0][4][0]}
+            # connect_timeout 必须有：Neon 不可达时 psycopg 默认可能挂很久，
+            # 启动钩子会卡住，连 /healthz 都探不到。
+            _ca["connect_timeout"] = int(os.environ.get("DB_CONNECT_TIMEOUT", "8"))
+            _kwargs["connect_args"] = _ca
     except OSError:
         pass  # 解析失败就按默认行为连接
     engine = create_engine(DATABASE_URL, **_kwargs)
@@ -65,16 +70,71 @@ else:
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 # 当前实际使用的后端类型（sqlite / postgres），供 /healthz 与启动日志报告
-IS_SQLITE = DATABASE_URL.startswith("sqlite")
 SQLITE_PATH = DATA_DIR / "handpan.db"
+# 降级后为 True。做成可变而非常量，因为 Postgres 配额爆掉时可能中途切到 SQLite。
+_state = {"sqlite": DATABASE_URL.startswith("sqlite"), "fallback": False}
+
+
+def db_backend() -> str:
+    """当前数据库后端类型：'sqlite' 或 'postgres'。"""
+    return "sqlite" if _state["sqlite"] else "postgres"
+
+
+def is_fallback() -> bool:
+    """是否处于「Postgres 不可用 → 降级到 SQLite」的应急状态。"""
+    return _state["fallback"]
 
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
 
 
+def fallback_to_sqlite(reason: str = "") -> bool:
+    """Postgres 不可用（配额超限 / 连接失败）时降级到本地 SQLite。
+
+    SQLite 文件落在 DATA_DIR —— Render 上挂的是 1GB 持久盘，跨重启保留。
+    单实例部署下 SQLite 完全够用；多副本部署会因为文件锁冲突失效，
+    那种场景应该升级 Neon 计划而不是依赖降级。
+
+    返回 True 表示降级成功。
+    """
+    if _state["sqlite"]:
+        return True  # 本来就是 SQLite
+    global engine, SessionLocal
+    try:
+        engine.dispose()
+    except Exception:  # noqa: BLE001
+        pass
+    url = f"sqlite:///{SQLITE_PATH.as_posix()}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    _state["sqlite"] = True
+    _state["fallback"] = True
+    try:
+        Base.metadata.create_all(engine)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("handpan.db").error("SQLite 降级后建表失败: %s", exc)
+        return False
+    logging.getLogger("handpan.db").warning(
+        "已降级到本地 SQLite (%s)：%s", SQLITE_PATH, reason)
+    return True
+
+
 def get_db():
+    """取一个会话。Postgres 连不上时自动降级到 SQLite 并重试本次请求。
+
+    降级发生在「拿到会话」这一刻（路由还没执行 SQL），所以当前这个请求
+    就能走 SQLite 完成，不需要等客户端重试。
+    """
     db = SessionLocal()
+    if not _state["sqlite"]:
+        try:
+            db.execute(select(1))
+        except Exception as exc:  # noqa: BLE001
+            db.close()
+            if not fallback_to_sqlite(str(exc)[:200]):
+                raise
+            db = SessionLocal()
     try:
         yield db
     finally:
