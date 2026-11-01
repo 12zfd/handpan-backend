@@ -187,6 +187,295 @@ select.sel{height:28px;border-radius:6px;border:1px solid #243040;background:#14
 <div id="modal-root"></div>
 <div id="stale-root"></div>
 <script>
+/* ==================================================================== *
+ * 本地 PDF 出稿：浏览器端复刻后端 score/render_pdf.py 的版式，
+ * 直接在内存里生成 PDF（A4 位图版式，JPEG 200DPI），零网络往返。
+ *
+ * 为什么要本地生成：
+ *   后端跑在 Render Free（0.1 CPU，15 分钟无访问就休眠），点下载要先
+ *   冷启动 + 服务器 matplotlib 出稿 + 传输，通常 2~6 秒起步。
+ *   谱面数据（score_json.bars）预览页早就拿到了，PDF 本质是纯几何
+ *   网格 + 音符标签，浏览器画它只要几十毫秒 —— 完全没必要绕服务器。
+ *
+ * 版式参数与 score/layout.py 一一对应（单一事实源），改动需两处同步。
+ * ==================================================================== */
+var HP = (function(){
+"use strict";
+
+/* ---- 版式常量（对齐 score/layout.py）---- */
+var PAGE = { w:210, h:297, ml:10, mr:10 };
+var SYSTEM = { perPage:6, pitch:39.5, firstMidY:59.8, bars:2 };
+var LINE = {
+  bar:  { lw:1.4, color:"#0A0A0A", h:20.1 },
+  long: { lw:0.7, color:"#8C8C8C", h:16.5 },
+  short:{ lw:0.5, color:"#B0B0B0", h:10.0 },
+  mid:  { lw:0.5, color:"#B8B8B8" }
+};
+var CELLS_PER_SUBBAR = 4;
+var NOTE = { upper:11.5, lower:10.5, gap:3.2 };
+var COLOR = {
+  blue:"#34589E", orange:"#E8912D", title:"#111111",
+  meta:"#6B6B6B", index:"#5A5A5A"
+};
+var TEXT = { title:18, tempo:11, barNo:7 };
+var INSTRUMENT = "D Kurd 9音";
+var DPI = 200;
+
+function mm2px(mm){ return mm * DPI / 25.4; }
+
+function cellsOf(sj){
+  var n = 16;
+  try { n = parseInt((sj.grid && sj.grid.cells) || 16, 10) || 16; } catch(e){}
+  return Math.max(4, Math.min(n, 24));
+}
+
+/* ---- 版式绘制：score_json 单页 → canvas ---- */
+function renderPage(sj, pageNo){
+  var W = Math.round(mm2px(PAGE.w)), H = Math.round(mm2px(PAGE.h));
+  var cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  var ctx = cv.getContext("2d");
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, W, H);
+  ctx.lineCap = "butt";
+
+  var name = ((sj.title || "") + "").replace(/（等 \d+ 页）$/, "").trim();
+  if(name === INSTRUMENT || name === "D Kurd 9" || name === "Handpan") name = "";
+  var bpm = (sj.tempo && sj.tempo.bpm) || 120;
+  var bars = sj.bars || [];
+  var cells = cellsOf(sj);
+  var perPage = SYSTEM.perPage * SYSTEM.bars;
+  var totalPages = Math.max(1, Math.ceil(bars.length / perPage));
+
+  var x0 = mm2px(PAGE.ml), x1 = mm2px(PAGE.w - PAGE.mr);
+  var width = x1 - x0, barW = width / SYSTEM.bars, cellW = barW / cells;
+
+  function yPx(fromTop){ return mm2px(fromTop); }
+  function text(str, x, y, sizePt, color, align, baseline, bold){
+    ctx.fillStyle = color;
+    ctx.textAlign = align || "center";
+    ctx.textBaseline = baseline || "alphabetic";
+    ctx.font = (bold ? "bold " : "") + Math.round(mm2px(sizePt / 2.54) * 0.72) + "px 'Segoe UI','Microsoft YaHei',Arial,sans-serif";
+    ctx.fillText(str, x, y);
+  }
+
+  if(pageNo === 0){
+    if(name){
+      text(name, W/2, yPx(16), TEXT.title, COLOR.title, "center", "top");
+      text(INSTRUMENT, W/2, yPx(16 + 9.5), TEXT.title*0.6, COLOR.meta, "center", "top");
+    } else {
+      text(INSTRUMENT, W/2, yPx(16), TEXT.title, COLOR.title, "center", "top");
+    }
+    text("\u2669 = " + bpm, x0, yPx(40), TEXT.tempo, COLOR.title, "left", "top");
+  }
+
+  var start = pageNo * perPage;
+  for(var i = 0; i < SYSTEM.perPage; i++){
+    var chunk = bars.slice(start + i*SYSTEM.bars, start + (i+1)*SYSTEM.bars);
+    if(!chunk.length) break;
+    var midTop = SYSTEM.firstMidY + i * SYSTEM.pitch;
+    var midC = yPx(midTop);
+    var firstBarNo = start + i*SYSTEM.bars + 1;
+
+    for(var b = 0; b < SYSTEM.bars; b++){
+      for(var c = 0; c <= cells; c++){
+        var x = x0 + b*barW + c*cellW, spec;
+        if(c === 0 || c === cells) spec = LINE.bar;
+        else if(c % CELLS_PER_SUBBAR === 0) spec = LINE.long;
+        else spec = LINE.short;
+        ctx.strokeStyle = spec.color;
+        ctx.lineWidth = mm2px(spec.lw / 2.54) * 0.72;
+        ctx.beginPath();
+        ctx.moveTo(x, yPx(midTop - spec.h/2));
+        ctx.lineTo(x, yPx(midTop + spec.h/2));
+        ctx.stroke();
+      }
+    }
+    ctx.strokeStyle = LINE.mid.color;
+    ctx.lineWidth = mm2px(LINE.mid.lw / 2.54) * 0.72;
+    ctx.beginPath();
+    ctx.moveTo(x0, midC); ctx.lineTo(x1, midC);
+    ctx.stroke();
+
+    for(var b2 = 0; b2 < SYSTEM.bars; b2++){
+      text(String(firstBarNo + b2), x0 + b2*barW,
+           yPx(midTop - LINE.bar.h/2 - 2.2), TEXT.barNo, COLOR.index,
+           "center", "bottom");
+    }
+
+    for(var b3 = 0; b3 < chunk.length; b3++){
+      var evs = (chunk[b3] && chunk[b3].events) || [];
+      for(var e = 0; e < evs.length; e++){
+        var slot = parseInt(evs[e].slot || 0, 10);
+        if(!(slot >= 0 && slot < cells)) continue;
+        var xN = x0 + b3*barW + (slot + 0.5)*cellW;
+        var notes = evs[e].notes || [];
+        for(var n = 0; n < notes.length; n++){
+          var hand = notes[n].hand || "upper";
+          if(hand === "mid") hand = "upper";
+          var upper = hand !== "lower";
+          var label = notes[n].label || (notes[n].pos ? String(notes[n].pos) : "S");
+          var color = upper ? COLOR.orange : COLOR.blue;
+          if(upper){
+            text(label, xN, yPx(midTop - NOTE.gap), NOTE.upper, color, "center", "bottom");
+          } else {
+            text(label, xN, yPx(midTop + NOTE.gap), NOTE.lower, color, "center", "top");
+          }
+        }
+      }
+    }
+  }
+
+  if(totalPages > 1){
+    text((pageNo+1) + " / " + totalPages, W - mm2px(PAGE.mr),
+         yPx(PAGE.h - 12 + 4), 7, COLOR.index, "right", "top");
+  }
+  return cv;
+}
+
+/* ---- 极简 PDF writer：canvas[] → PDF Blob（JPEG Image XObject）---- */
+function canvasesToPdf(canvases, title){
+  function lbytes(str){
+    var u = new Uint8Array(str.length);
+    for(var i = 0; i < str.length; i++) u[i] = str.charCodeAt(i) & 0xFF;
+    return u;
+  }
+  function toJpeg(cv){
+    var dataUrl = cv.toDataURL("image/jpeg", 0.92);
+    var b64 = dataUrl.split(",")[1];
+    var bin = atob(b64), u = new Uint8Array(bin.length);
+    for(var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+  var n = canvases.length;
+  var W = Math.round(mm2px(PAGE.w) * 72 / DPI * 100) / 100;  // pt
+  var H = Math.round(mm2px(PAGE.h) * 72 / DPI * 100) / 100;
+
+  var chunks = [], offsets = [], pos = 0;
+  function push(b){ chunks.push(b); pos += b.length; }
+  function pushStr(s){ push(lbytes(s)); }
+  function obj(id, body){
+    offsets[id] = pos;
+    pushStr(id + " 0 obj\n" + body + "\nendobj\n");
+  }
+
+  pushStr("%PDF-1.4\n%\u00E2\u00E3\u00CF\u00D3\n");
+  var pageIds = [], imgIds = [];
+  for(var i = 0; i < n; i++){
+    pageIds.push(3 + i*3);
+    imgIds.push(5 + i*3);
+  }
+  obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+  var kids = pageIds.map(function(id){ return id + " 0 R"; }).join(" ");
+  obj(2, "<< /Type /Pages /Count " + n + " /Kids [" + kids + "] >>");
+  for(var p = 0; p < n; p++){
+    var pageId = 3 + p*3, cId = 4 + p*3, imgId = 5 + p*3;
+    obj(pageId, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + W + " " + H + "] " +
+        "/Resources << /XObject << /Im" + p + " " + imgId + " 0 R >> >> " +
+        "/Contents " + cId + " 0 R >>");
+    var jpeg = toJpeg(canvases[p]);
+    obj(cId, "<< /Length " + ("q " + W + " 0 0 " + H + " 0 0 cm /Im" + p + " Do Q").length + " >>\nstream\nq " + W + " 0 0 " + H + " 0 0 cm /Im" + p + " Do Q\nendstream");
+    offsets[imgId] = pos;
+    pushStr(imgId + " 0 obj\n<< /Type /XObject /Subtype /Image /Width " + canvases[p].width +
+            " /Height " + canvases[p].height + " /ColorSpace /DeviceRGB " +
+            "/BitsPerComponent 8 /Filter /DCTDecode /Length " + jpeg.length + " >>\nstream\n");
+    push(jpeg);
+    pushStr("\nendstream\nendobj\n");
+  }
+  var total = pos;
+  var xref = "xref\n0 " + (3 + n*3) + "\n0000000000 65535 f \n";
+  for(var id2 = 1; id2 < 3 + n*3; id2++){
+    xref += (offsets[id2] !== undefined
+      ? ("0000000000" + offsets[id2]).slice(-10) + " 00000 n \n"
+      : "0000000000 65535 f \n");
+  }
+  xref += "trailer\n<< /Size " + (3 + n*3) +
+          " /Root 1 0 R >>\nstartxref\n" + total + "\n%%EOF";
+  pushStr(xref);
+
+  var len = 0;
+  chunks.forEach(function(c){ len += c.length; });
+  var out = new Uint8Array(len), off = 0;
+  chunks.forEach(function(c){ out.set(c, off); off += c.length; });
+  return new Blob([out], { type: "application/pdf" });
+}
+
+function safeName(s){
+  return ((s || "score") + "").replace(/[\\\/:*?"<>|]/g, "_");
+}
+
+/* ---- 对外入口：score_json → 生成 PDF Blob（不直接触发保存）---- */
+function buildPdfBlob(scoreJson, baseName){
+  var bars = (scoreJson && scoreJson.bars) || [];
+  if(!bars.length) throw new Error("谱面数据为空，无法本地出稿");
+  var perPage = SYSTEM.perPage * SYSTEM.bars;
+  var pages = Math.max(1, Math.ceil(bars.length / perPage));
+  var canvases = [];
+  for(var i = 0; i < pages; i++) canvases.push(renderPage(scoreJson, i));
+  return canvasesToPdf(canvases, safeName(baseName));
+}
+
+/* ---- 对外入口：score_json → 自动保存/打开 ---- */
+function downloadLocalPdf(scoreJson, baseName){
+  var blob = buildPdfBlob(scoreJson, baseName);
+  var name = safeName(baseName) + "_D Kurd 9音.pdf";
+  triggerDownload(blob, name);
+  return name;
+}
+
+return { downloadLocalPdf: downloadLocalPdf, buildPdfBlob: buildPdfBlob,
+         renderPage: renderPage, canvasesToPdf: canvasesToPdf };
+})();
+
+/* ---- 下载触发 ----
+   桌面：浏览器本地用 canvas 画 PDF，a.download 直接存盘（零网络、瞬时）。
+   移动端：应用内网页环境（含微信/App 内嵌浏览器）无法把 blob 存到本机文件系统，
+           所以改为「跳转到手机原生浏览器」打开后端 /download 真实链接，
+           由原生浏览器负责下载（系统会弹保存确认 = 用户同意）。
+*/
+function mobileOpenNative(id){
+  var t = token();
+  var url = BACKEND + '/download/' + encodeURIComponent(id) + (t ? ('?token=' + encodeURIComponent(t)) : '');
+  var w = window.open(url, '_blank');   // 必须在点击事件同步阶段调用，才不会被当弹窗拦
+  if(!w){
+    // 弹窗被拦：页内模态 + 真实可点链接（用户手动点 = 真手势，原生浏览器会下载）
+    showPdfModal(url);
+  }
+}
+
+function showPdfModal(url){
+  var ov = document.getElementById('pdf-modal');
+  if(!ov){
+    ov = document.createElement('div');
+    ov.id = 'pdf-modal';
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
+    ov.innerHTML =
+      '<div style="background:#fff;border-radius:12px;max-width:480px;width:100%;max-height:90vh;overflow:auto;padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.3)">'+
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'+
+          '<b style="font-size:16px">PDF 下载</b>'+
+          '<span id="pdf-modal-close" style="cursor:pointer;font-size:22px;line-height:1;padding:4px 8px">×</span>'+
+        '</div>'+
+        '<p style="font-size:13px;color:#666;margin:0 0 12px">浏览器将打开下载页，请在原生浏览器中用「分享 → 存储到文件」保存。</p>'+
+        '<a id="pdf-modal-open" href="#" target="_blank" rel="noopener" style="display:block;text-align:center;background:#667eea;color:#fff;text-decoration:none;padding:14px;border-radius:8px;font-size:15px;font-weight:600">📂 打开 / 保存到文件</a>'+
+        '<p style="font-size:12px;color:#999;margin:10px 0 0">若按钮无效，可长按上方链接选择「下载链接文件」。</p>'+
+      '</div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function(ev){
+      if(ev.target.id === 'pdf-modal-close' || ev.target === ov) ov.remove();
+    });
+  }
+  ov.querySelector('#pdf-modal-open').href = url;
+  ov.style.display = 'flex';
+}
+
+function triggerDownload(blob, filename){
+  // 桌面：a.download 直接存盘
+  var url = URL.createObjectURL(blob);
+  var d = document.createElement('a');
+  d.href = url; d.download = filename;
+  document.body.appendChild(d); d.click(); d.remove();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+}
 (function(){
 "use strict";
 
@@ -312,6 +601,25 @@ async function detectBase(){
 }
 function apiUrl(path){ return BASE + path; }
 
+/* ------------------------------------------------------------------ 故障自诊断
+   后端 5xx 现在会带 CORS 头，所以能读到 body；但若是真·网络不通（服务挂了/被墙），
+   fetch 会直接 reject。这里先用 /healthz?deep=1 探一次，把「网络不通」和
+   「数据库炸了」区分开，避免再一律报「连不上后端服务」误导排查方向。        */
+function diagnoseBackend(){
+  return fetch(apiUrl('/healthz?deep=1'), {method:'GET', cache:'no-store'})
+    .then(function(res){ return res.json().catch(function(){ return null; }); })
+    .then(function(b){
+      if(!b) return '连不上后端服务（网络不通或后端未启动）';
+      if(b.db === 'unavailable'){
+        return '后端服务在运行，但数据库不可用：' + (b.error || '未知原因');
+      }
+      return '连不上后端服务（网络不通或后端未启动）';
+    })
+    .catch(function(){
+      return '连不上后端服务（网络不通或后端未启动）';
+    });
+}
+
 /* ------------------------------------------------------------------ 请求 */
 function request(path, opts){
   opts = opts || {};
@@ -341,7 +649,7 @@ function request(path, opts){
     })
     .catch(function(e){
       if(e && e.message && /Failed to fetch|NetworkError|load failed/i.test(e.message)){
-        throw new Error('连不上后端服务（可能是跨域被拦或网络不通）');
+        return diagnoseBackend().then(function(msg){ throw new Error(msg); });
       }
       throw e;
     });
@@ -385,17 +693,13 @@ var api = {
             if(star) name = decodeURIComponent(star[1]);
             else if(plain) name = plain[1];
           } catch(e){}
-          var url = URL.createObjectURL(blob);
-          var a = document.createElement('a');
-          a.href = url; a.download = name;
-          document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+          triggerDownload(blob, name);
           return name;
         });
       })
       .catch(function(e){
         if(e && e.message && /Failed to fetch|NetworkError/i.test(e.message)){
-          throw new Error('连不上后端服务，请确认后端已启动');
+          return diagnoseBackend().then(function(msg){ throw new Error(msg); });
         }
         throw e;
       });
@@ -735,12 +1039,32 @@ function renderRows(){
 }
 
 async function downloadRow(id){
+  var ua = navigator.userAgent || "";
+  var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  // 移动端：跳转到原生浏览器下载（应用内网页环境存不了本机文件）
+  if(isMobile){
+    mobileOpenNative(id);
+    setNotice('ok','已打开下载窗口，请在浏览器中确认保存');
+    return;
+  }
   var row = S.rows.filter(function(r){ return r.id===id; })[0];
   var base = ((row && row.title) || ('score-'+id)).replace(/[\\/:*?"<>|]/g,'_');
+  // 优先本地出稿：先拉谱面 JSON（一次轻量请求，顺带唤醒后端），
+  // 浏览器直接画 PDF —— 服务器不再渲染/传输 PDF 本体。
   try{
-    var name = await api.downloadPdf(id, base+'_D Kurd 9音.pdf');
-    setNotice('ok','已开始下载：'+name);
-  }catch(e){ setNotice('err', e.message); }
+    var d = await api.detail(id);
+    if(d && d.midi_data_json && (d.midi_data_json.bars||[]).length){
+      var name = HP.downloadLocalPdf(d.midi_data_json, base);
+      setNotice('ok','已本地出稿：'+name);
+      return;
+    }
+  }catch(localErr){ /* 拉取或本地渲染失败 → 回退服务器出稿 */ }
+  try{
+    var name2 = await api.downloadPdf(id, base+'_D Kurd 9音.pdf');
+    setNotice('ok','已开始下载：'+name2);
+  }catch(e){
+    setNotice('err', e.message);
+  }
 }
 
 /* ------------------------------------------------------------------ 轮询 */
@@ -1277,7 +1601,24 @@ async function applyTempo(){
 async function downloadPreviewPdf(){
   var p = pv();
   if(!p) return;
+  var ua = navigator.userAgent || "";
+  var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  // 移动端：跳转到原生浏览器下载（应用内网页环境存不了本机文件）
+  if(isMobile){
+    mobileOpenNative(p.id);
+    setNotice('ok','已打开下载窗口，请在浏览器中确认保存');
+    return;
+  }
   var base = ((p.data && p.data.title) || ('score-'+p.id)).replace(/[\\/:*?"<>|]/g,'_');
+  // 优先本地出稿：预览页手头就有完整谱面数据，浏览器直接画 PDF，
+  // 不经过服务器（Render Free 冷启动 + 0.1 CPU 是下载慢的根源）。
+  try{
+    var name = HP.downloadLocalPdf(p.data, base);
+    setNotice('ok','已本地出稿（0 网络请求）：'+name);
+    return;
+  }catch(localErr){
+    // 数据不完整等原因本地失败，回退服务器出稿
+  }
   try{
     await api.downloadPdf(p.id, base+'_D Kurd 9音.pdf');
   }catch(e){

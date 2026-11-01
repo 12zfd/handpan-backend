@@ -33,7 +33,8 @@ from fastapi import (
     BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile, status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.requests import Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -59,12 +60,14 @@ MAX_FILES = 5          # 图片一次最多 5 张（多页谱）
 
 bearer = HTTPBearer(auto_error=False)
 
-app = FastAPI(title="Handpan Sheet Forge", version="1.1.0")
+app = FastAPI(title="Handpan Sheet Forge", version="1.1.1")
+
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in os.environ.get(
-        "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,9 +76,49 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """全局兜底：未捕获异常也必须带上 CORS 头。
+
+    Starlette 中间件顺序为 ServerErrorMiddleware(最外) -> CORSMiddleware ->
+    ExceptionMiddleware -> router。未捕获异常由 ServerErrorMiddleware 生成 500，
+    它在 CORSMiddleware **外层**，所以 500 响应里没有 Access-Control-Allow-Origin，
+    浏览器会把跨域 500 当成网络故障 -> fetch() reject "Failed to fetch"
+    -> 前端误报「连不上后端服务」。
+
+    这里显式补上 CORS 头，并返回可读的错误码，让前端能区分
+    「数据库挂了」和「真的网络不通」。
+    """
+    logger = logging.getLogger("handpan.unhandled")
+    logger.exception("未处理异常: %s %s", request.method, request.url.path)
+
+    detail = "服务器内部错误"
+    code = "internal_error"
+    text = str(exc).lower()
+    if "exceeded the quota" in text or "too many connections" in text:
+        detail = "数据库配额或连接数已超限，请稍后重试（服务端数据库额度用尽）"
+        code = "db_quota_exceeded"
+    elif "operationalerror" in text or "connection" in text:
+        detail = "数据库暂时不可用，请稍后重试"
+        code = "db_unavailable"
+
+    resp = JSONResponse(status_code=500, content={"detail": detail, "code": code})
+    origin = request.headers.get("origin")
+    if origin and (origin in ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    init_db()
+    # 数据库连不上（配额超限 / 临时不可用）时不能让整个容器起不来，
+    # 否则连 /healthz 都探不到，完全没法自愈和诊断。
+    try:
+        init_db()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("handpan.startup").error("数据库初始化失败（服务仍启动）: %s", exc)
 
 
 @app.middleware("http")
@@ -588,8 +631,26 @@ def original_file(
 
 
 @app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": int(time.time())}
+def healthz(deep: int = Query(default=0, ge=0, le=1)):
+    """存活探针。deep=1 时额外做一次真实数据库查询。
+
+    之前 /healthz 完全不碰数据库，所以数据库挂掉时它仍返回 200，
+    表现为「服务活着但所有功能全挂」，很难第一时间发现问题。
+    """
+    out: dict = {"ok": True, "ts": int(time.time())}
+    if deep:
+        try:
+            db = next(get_db())
+            try:
+                db.execute(select(1)).scalar()
+                out["db"] = "ok"
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            out["ok"] = False
+            out["db"] = "unavailable"
+            out["error"] = str(exc)[:200]
+    return out
 
 
 @app.get("/api-status")
