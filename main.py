@@ -45,7 +45,7 @@ from models import Score, User
 from pipeline import render_only, run_pipeline
 from score.note_mapper import requantize
 from security import decode_token, make_token, verify_password
-from storage import dump_keys, local_path, parse_keys, presign_get, upload_bytes
+from storage import dump_keys, download_bytes, local_path, parse_keys, presign_get, upload_bytes
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -501,6 +501,25 @@ def download(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "PDF 尚未生成")
 
     name = _pdf_name(s)
+
+    # 同域代理：服务端拉取对象存储（S3/R2）字节后直接回传，浏览器只与后端通信。
+    # 避免浏览器跨域直连 Supabase（国内链路不稳、跨域重定向在部分网络/浏览器下会被拦），
+    # 也免去「后端 302 → 第三方存储 → 浏览器」的多跳。代理失败再回退老行为。
+    try:
+        data = download_bytes(s.pdf_url)
+        if data:
+            from urllib.parse import quote
+            return Response(
+                data,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}",
+                    "Cache-Control": "public, max-age=3600",
+                },
+            )
+    except Exception as exc:  # 代理偶发失败（网络抖动）→ 退回 302 预签名，最后退回本地盘
+        logging.getLogger("download").warning("PDF 同域代理失败，回退 302：%s", exc)
+
     url = presign_get(s.pdf_url, expires=86400, download_name=name)
     if url:
         return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
