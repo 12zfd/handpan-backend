@@ -128,11 +128,17 @@ def _normalize(raw: bytes, target_width: int) -> bytes:
     if im.width == target_width:
         return raw
     ratio = target_width / float(im.width)
-    im = im.resize(
-        (max(1, int(round(im.width * ratio))),
-         max(1, int(round(im.height * ratio)))),
-        Image.LANCZOS,
-    )
+    new_w = max(1, int(round(im.width * ratio)))
+    new_h = max(1, int(round(im.height * ratio)))
+    # 高度安全上限：极端长图（如超长竖截图）统一压到该高度以内，
+    # 保证归一化后的图不会撑爆内存。det 内部仍会二次缩放到固定输入，
+    # 这里只是兜底上限（默认 4096，可用 OCR_MAX_HEIGHT 调整）。
+    MAX_H = int(os.environ.get("OCR_MAX_HEIGHT") or 4096)
+    if new_h > MAX_H:
+        h_ratio = MAX_H / float(new_h)
+        new_w = max(1, int(round(new_w * h_ratio)))
+        new_h = MAX_H
+    im = im.resize((new_w, new_h), Image.LANCZOS)
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
@@ -752,10 +758,12 @@ def image_to_tab(raw: bytes | list[bytes],
                  timing: "_Timing | None" = None) -> dict:
     """raw 可以是单张 bytes，也可以是按顺序排列的多张（最多 5 张）。
 
-    时值**以输入图为准**：
-        一条横线 = 占 2 格，两条 = 占 1 格，无横线 = 1 格。
-    实测这张谱按此规则共 376 格 ≈ 23.5 小节（原谱 22），而"每字 1 格"只有 19 小节，
-    说明横线确实代表时值，所以不再人为把每行压回 32 格。
+    时值（长短）**以输入图的横线为准** —— 横线代表这个音「响多少格」：
+        无横线 = 1 格（最短），一条横线 = 2 格，两条横线 = 4 格（最长）。
+    即「横线越多 = 音越长」（音乐通用记法）。旧版曾把两条横线映射成 1 格
+    （比一条还短），属于反向 bug，且 dur 算出来却从没进过导出，导致所有音
+    无论长短在 PDF/试听里都等长 —— 这正是用户说的「图片识别长短问题」。
+    现在把 dur 真正带进 build_score → midi_data_json，PDF 与试听都能区分长短。
     """
     engine_name = os.environ.get("OMR_ENGINE", "tab").lower().strip()
     pages = raw if isinstance(raw, list) else [raw]
@@ -769,7 +777,11 @@ def image_to_tab(raw: bytes | list[bytes],
     from score.note_mapper import D_KURD_9
 
     midi_of = {x["pos"]: x["midi"] for x in D_KURD_9}
-    DUR_OF = {0: 1, 1: 2, 2: 1}
+    # 时值模型（横向符杠数 → 该音持续多少「格」）：无=1，一条=2，两条=4。
+    # 注意：这是「响的时长」，不改变落格位置（位置由 OCR 的 x 决定，已含节奏间距）；
+    # 长音与后一个音在时值上重叠（手碟延音未止即敲下一音），属正常。
+    # 旧值 {0:1,1:2,2:1} 把两条横线判成最短，已修正。
+    DUR_OF = {0: 1, 1: 2, 2: 4}
 
     events: list[dict] = []
     beam_dist = {0: 0, 1: 0, 2: 0}
@@ -844,7 +856,7 @@ def image_to_tab(raw: bytes | list[bytes],
     head_txt = f"从 {len(pages)} 张图里" if len(pages) > 1 else "从图里"
     warnings = [
         f"{head_txt}读出 {total_rows} 行：{pitched} 个有音高，{unpitched} 个无音高敲击",
-        "时值按输入图的横线排：一条占 2 格、两条占 1 格、无横线占 1 格",
+        "时值按输入图的横线排：无横线=1 格、一条=2 格、两条=4 格（横线越多音越长）",
         f"排布结果 {cursor} 格 ≈ {bars} 小节（应与原谱一致；有偏差说明横线检测有误，请对照原图校对）",
     ]
     if _LAST_TWO_COLUMN:

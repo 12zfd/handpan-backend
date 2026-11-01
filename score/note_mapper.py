@@ -136,6 +136,10 @@ def build_score(
         slot_abs = int(round(ev[0]["start"] / sec_per_slot))
         if slot_abs < 0:
             continue
+        # 时值（长短）：来自 OMR 符杠数；视频/MIDI 通道没有 → 默认 1 格。
+        # 这是「响的时长」，不移动落格位置（位置已由 start 决定）。
+        ev_dur = max(1, min(4, int(ev[0].get("dur") or 1)))
+        ev_dur_sec = round(ev_dur * sec_per_slot, 3)
         bar_idx, slot = divmod(slot_abs, cells)
         cell = grid.setdefault((bar_idx, slot), {"bar": bar_idx, "slot": slot, "notes": []})
 
@@ -148,13 +152,15 @@ def build_score(
             cell["notes"].append(note)
 
         def _from_m(m: dict) -> dict:
-            d = {"pos": m["pos"], "midi": m["midi"], "approx": m["approx"]}
+            d = {"pos": m["pos"], "midi": m["midi"], "approx": m["approx"],
+                 "dur": ev_dur, "dur_sec": ev_dur_sec}
             if m.get("label"):
                 d["label"] = m["label"]
             return d
 
         tap_note = {"pos": 0, "midi": 0, "label": tap_label or "S",
-                    "kind": "stroke", "approx": False}
+                    "kind": "stroke", "approx": False,
+                    "dur": ev_dur, "dur_sec": ev_dur_sec}
 
         if ordered:
             top = ordered[-1]
@@ -213,7 +219,8 @@ def build_score(
         # ★ 原始时间戳：改 BPM 重排的唯一依据（无音高敲击存 null）
         "raw": [
             [round(float(n["start"]), 3),
-             None if n.get("pitch") is None else int(round(n["pitch"]))]
+             None if n.get("pitch") is None else int(round(n["pitch"])),
+             int(n.get("dur") or 1)]
             for n in note_events
         ],
         "bars": out_bars,
@@ -230,7 +237,11 @@ def requantize(score_json: dict, bpm: float) -> dict:
     if not raw:
         raise ValueError("缺少 raw 时间戳，无法重排，请重新提取素材")
 
-    events = [{"start": t, "pitch": p} for t, p in raw]
+    events = []
+    for row in raw:
+        t, p = row[0], row[1]
+        d = row[2] if len(row) >= 3 else 1   # 兼容老数据（只有 [start, pitch]）
+        events.append({"start": t, "pitch": p, "dur": d})
     rebuilt = build_score(
         events,
         bpm=bpm,

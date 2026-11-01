@@ -131,13 +131,23 @@ def _draw_system(ax, mid_top: float, bars: list[dict], first_bar_no: int, cells:
                 color = COLOR["orange"] if is_upper else COLOR["blue"]
 
                 if is_upper:
-                    ax.text(x, mid_c + NOTE["gap_mm"], label,
+                    yl = mid_c + NOTE["gap_mm"]
+                    ax.text(x, yl, label,
                             fontsize=NOTE["upper_size"], ha="center", va="bottom",
                             color=color, fontfamily=NUM)
+                    yline = yl - 1.2
                 else:
-                    ax.text(x, mid_c - NOTE["gap_mm"], label,
+                    yl = mid_c - NOTE["gap_mm"]
+                    ax.text(x, yl, label,
                             fontsize=NOTE["lower_size"], ha="center", va="top",
                             color=color, fontfamily=NUM)
+                    yline = yl + 1.2
+                # 时值（长短）：dur>1 时向右画一条延音线，直观区分长短音
+                dur = int(n.get("dur") or 1)
+                if dur > 1:
+                    x_end = x + (dur - 1) * cell_w * 0.92
+                    ax.plot([x, x_end], [yline, yline], color=color,
+                            lw=0.8, solid_capstyle="butt", alpha=0.85)
 
 
 def _draw_page(ax, score_json: dict, page: int, total_pages: int = 1) -> None:
