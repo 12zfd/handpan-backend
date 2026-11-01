@@ -154,6 +154,26 @@ def current_user(
     return user
 
 
+# 与 current_user 等价，但额外允许通过 URL ?token= 传入 JWT。
+# 用途：移动端「跳转到原生浏览器下载」是顶层导航，无法携带 Authorization 请求头，
+# 只能把 token 放在 URL 里；桌面端 / fetch 仍走 Authorization 头，两种都支持。
+def current_user_from_header_or_query(
+    cred: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    db: Annotated[Session, Depends(get_db)],
+    token: str | None = Query(default=None, alias="token"),
+) -> User:
+    raw = cred.credentials if cred is not None else (token or None)
+    if not raw:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录")
+    payload = decode_token(raw)
+    if not payload or "sub" not in payload:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效，请重新登录")
+    user = db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在")
+    return user
+
+
 @app.post("/login", response_model=TokenOut)
 def login(body: LoginIn, db: Annotated[Session, Depends(get_db)]):
     user = db.scalar(select(User).where(User.username == body.username))
@@ -493,7 +513,7 @@ def set_tempo(
 @app.get("/download/{score_id}")
 def download(
     score_id: int,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(current_user_from_header_or_query)],
     db: Annotated[Session, Depends(get_db)],
 ):
     s = db.get(Score, score_id)
