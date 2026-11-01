@@ -7,6 +7,7 @@ import time
 import traceback
 
 from database import SessionLocal
+from sqlalchemy.orm.attributes import flag_modified
 from extract.audio import bpm_from_audio, video_to_note_events
 from extract.midi_file import midi_to_note_events
 from extract.omr import image_to_tab, _Timing
@@ -27,9 +28,45 @@ _OCR_LOCK = threading.Semaphore(1)
 
 
 
+def _with_metrics(score_json: dict, metrics: dict) -> dict:
+    """把 metrics 挂到 score_json 上，并返回**全新的外层 dict**。
+
+    为什么必须换外层（这是真实 Neon/Postgres 上实测出来的，不是推理）：
+    SQLAlchemy 判定 JSON 列「变没变」用的是**值相等比较**。生产 session 是
+    `expire_on_commit=False`，commit 后属性不失效，committed_state 里存的就是
+    **同一个对象引用**。于是：
+      · 原地改 metrics → 旧值快照被同步污染 → 两者永远相等 → 永不判脏
+      · 只换内层 dict 不够：外层还是同一引用 → 外层值依然相等 → 依然不判脏
+      · 实测（Neon Postgres，临时表 t_json_probe）：这两种写法都会让
+        render_ms / total_ms **静默丢失**
+    换一个新的外层 dict 后，外层引用变了 → 值不再相等 → 正常判脏落库。
+
+    `flag_modified` 是第二道保险（见 _set），两者都上，任何写法都安全。
+    """
+    return {**score_json, "metrics": dict(metrics)}
+
+
 def _set(db, score: Score, **kw) -> None:
+    """写字段并提交。
+
+    `midi_data_json` 是 JSON 列，SQLAlchemy 判定它「变没变」用的是**值相等
+    比较**。生产 session 是 `expire_on_commit=False`，commit 后属性不失效，
+    committed_state 里存的就是同一个对象引用 → 原地改它会同步污染旧值快照
+    → 两者永远相等 → 永不判脏 → 字段**静默丢失**（实测 render_ms / total_ms
+    就是这么消失的）。
+
+    两道保险一起上，任何写法都安全：
+      1. `flag_modified` —— 显式标脏，绕过值相等比较（实测有效）
+      2. 调用方用 `_with_metrics()` 返回**全新外层 dict** —— 外层引用变了，
+         值不再相等，正常判脏（实测有效）
+
+    注意：**只换内层 dict 不够**（外层还是同一引用 → 外层值依然相等 → 依然丢）。
+    `MutableDict` 也不行 —— 它只追踪顶层 key 变化，嵌套 dict 改动照样丢。
+    """
     for k, v in kw.items():
         setattr(score, k, v)
+    if "midi_data_json" in kw:
+        flag_modified(score, "midi_data_json")
     db.commit()
 
 
@@ -112,7 +149,7 @@ def run_pipeline(score_id: int) -> None:
                  error_message="未识别到有效音符，建议换更清晰的素材或改用手动录入")
             return
         metrics["map_ms"] = int((time.time() - t) * 1000)
-        score_json["metrics"] = metrics
+        score_json = _with_metrics(score_json, metrics)
         _set(db, score, midi_data_json=score_json)
 
         # ---------- ③ 排版 + ④ 出稿
@@ -120,11 +157,11 @@ def run_pipeline(score_id: int) -> None:
         t = time.time()
         pdf = render_score_pdf(score_json)
         metrics["render_ms"] = int((time.time() - t) * 1000)
-        score_json["metrics"] = metrics
+        score_json = _with_metrics(score_json, metrics)
         _set(db, score, midi_data_json=score_json, pdf_url=_store_pdf(score, pdf), status="done")
 
         metrics["total_ms"] = int((time.time() - t0) * 1000)
-        score_json["metrics"] = metrics
+        score_json = _with_metrics(score_json, metrics)
         _set(db, score, midi_data_json=score_json)
 
     except Exception as exc:  # noqa: BLE001
