@@ -219,7 +219,8 @@ def _dedup(items: list[dict]) -> list[dict]:
     return out
 
 
-def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dict]:
+def recognize_raster(image_bytes: bytes, timing: dict | None = None,
+                     engine=None) -> list[dict]:
     """识别一张谱面截图，返回原图坐标系的 OcrItem 列表。
 
     OcrItem = {"text", "x0", "x1", "yc", "h"}（与 ocr_provider 的契约一致）
@@ -227,6 +228,8 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
     `timing` 若传入 dict，会写入分段耗时：
         decode_ms —— 图片解码（PIL 打开 + 转 numpy）
         infer_ms  —— 模型推理（det + rec）
+    `engine` 传入已建好的 _EngineAdapter 时复用（网格通道与 det 通道
+    共享同一个引擎，省一次 ~1s 的模型加载）。
     """
     import time as _time
 
@@ -268,7 +271,7 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
         )
         back = width / float(det_w)
 
-    engine = _EngineAdapter(_load_engine())
+    engine = engine if engine is not None else _EngineAdapter(_load_engine())
     spans = _plan_blocks(gray, det_h, det_w)
 
     items: list[dict] = []
@@ -318,3 +321,227 @@ def recognize_raster(image_bytes: bytes, timing: dict | None = None) -> list[dic
     if timing is not None:
         timing["infer_ms"] = int((_time.time() - t_inf) * 1000)
     return _dedup(items)
+
+
+# ═════════════════════════════════════════════════════════════════
+# 方案 A：网格通道（跳过 det，连通域找字符格 → 逐格 rec）
+#
+# 为什么需要第二条通道
+# --------------------
+# 真实书页拍照谱（如 D Kurd 9音《晴天》，米色纸底 + 水印圈 + 八度点）
+# 上，det 通道系统性失败（_test/probe_rec_only.py 实测）：
+#     - `D` 召回 0/4，`x` 大量丢失，后 4 行整行丢（框数 57 且集中在
+#       上半页）；放大反而更糟（整页 60 框 → 48 框，单行放大 → 0 框）。
+#     - 整行直接喂 rec（V2）字符召回反而极好（conf 0.83~0.86）——
+#       瓶颈在 det，不在 rec。
+#
+# 本通道的取巧：谱面字符是**纸上孤立的墨块**，不需要 det 找框 ——
+# 二值化 + 连通域就能精确拿到每个字符的包围盒，再逐格喂 rec：
+#     实测（original_right.png，_test/probe_v4_components.py）：
+#     D 召回 0 → 4/4（100%），8 个谱面行全部还原，x/S 基本齐全。
+#
+# 与 det 通道的关系
+# -----------------
+#     - 输出契约完全一致（OcrItem），omr.py 的落格机制两通道共用；
+#     - 上层路由见 omr._page_tokens：网格有效行 > det 有效行时用网格；
+#     - 应用截图（纯白底、橙色音符）会被照片守卫拦下，恒走 det 通道，
+#       原有校准结果零影响。
+# ═════════════════════════════════════════════════════════════════
+
+# 二值化阈值（灰度 < 阈值算墨迹）。水印圈 / 纸纹 ~200+，不会入域。
+GRID_BIN_THRESHOLD = _env_int("OCR_GRID_BIN", 150)
+# 面积过滤：连通域面积 < 全页主字符面积中位数 × 该系数 → 八度点/杂点，丢。
+GRID_AREA_FRACTION = _env_float("OCR_GRID_AREA_FRAC", 0.45)
+# 行过滤：一行主字符高度中位数 < 全页最高行 × 该系数 → 八度点行，丢。
+GRID_ROW_H_RATIO = _env_float("OCR_GRID_ROW_H", 0.75)
+# 一行至少这么多个字符才算谱面行（八度点行通常 ≤ 8 个）。
+GRID_MIN_ROW_CHARS = _env_int("OCR_GRID_MIN_CHARS", 4)
+# 照片守卫：近白像素（灰度 ≥ 248）占比 ≥ 该阈值 → 判为应用截图，
+# 本通道直接让路（恒走 det 通道）。OCR_GRID_FORCE=1 可强制跑（测试用）。
+GRID_PHOTO_WHITE_FRAC = _env_float("OCR_GRID_WHITE_FRAC", 0.60)
+
+# rec 常把 ×（U+00D7）读出来、全角数字也偶现，统一折算。
+_GRID_CHAR_MAP = str.maketrans({
+    "×": "x", "Ⅹ": "x", "✕": "x", "✖": "x",
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+})
+
+
+def _looks_like_photo(gray: np.ndarray) -> bool:
+    """书页拍照谱 vs 应用截图的廉价判别：近白像素占比。
+
+    米色纸底的照片近白占比 ≈ 0；应用截图（白底）≈ 0.9+。
+    """
+    try:
+        return float((gray >= 248).mean()) < GRID_PHOTO_WHITE_FRAC
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _grid_clean(text: str) -> str:
+    """网格通道单字符归一：全角→半角、×→x，去空白。"""
+    return str(text).translate(_GRID_CHAR_MAP).replace(" ", "").strip()
+
+
+def _grid_components(gray: np.ndarray) -> tuple[list[dict], dict]:
+    """二值化 + 连通域 → 主字符候选框（八度点/符杠/小节线已滤除）。"""
+    import cv2  # rapidocr 的传递依赖，缺失时网格通道整体让路
+
+    binimg = (gray < GRID_BIN_THRESHOLD).astype(np.uint8)
+    n, _labels, stats, _cent = cv2.connectedComponentsWithStats(binimg, connectivity=8)
+    comps: list[dict] = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if area <= 0:
+            continue
+        comps.append({"x0": x, "y0": y, "w": w, "h": h,
+                      "area": area, "x1": x + w, "y1": y + h,
+                      "yc": y + h / 2.0})
+    if not comps:
+        return [], {"components": 0}
+
+    # 高度中位数：横线/竖线是少数派，中位数落在主字符上
+    hs = sorted(c["h"] for c in comps)
+    med_h = hs[len(hs) // 2]
+
+    # 第一轮：长横线（符杠）与长竖线（小节线/纸边框）。
+    # 用相对阈值（×中位数），字符 '1'（细高但高度 ≈ 中位数）不受误伤。
+    cands: list[dict] = []
+    beams = vlines = 0
+    for c in comps:
+        if c["w"] >= 4 * c["h"] and c["w"] >= 1.6 * med_h:
+            beams += 1
+            continue
+        if c["h"] >= 4 * c["w"] and c["h"] >= 1.6 * med_h:
+            vlines += 1
+            continue
+        cands.append(c)
+
+    # 第二轮：面积过滤（八度点等小件）
+    areas = sorted(c["area"] for c in cands)
+    med_area = areas[len(areas) // 2] if areas else 0
+    main: list[dict] = []
+    dots = 0
+    floor = max(20, med_area * GRID_AREA_FRACTION)
+    for c in cands:
+        if c["area"] < floor:
+            dots += 1
+            continue
+        main.append(c)
+    return main, {"components": n - 1, "beams": beams, "vlines": vlines,
+                  "dots_dropped": dots, "median_h": med_h,
+                  "median_area": med_area, "main": len(main)}
+
+
+def _grid_group_rows(comps: list[dict]) -> list[list[dict]]:
+    """按 yc 聚行（与 omr._group_rows 同思路，容差取高度中位数 × 0.6）。"""
+    if not comps:
+        return []
+    hs = sorted(c["h"] for c in comps)
+    tol = max(10.0, hs[len(hs) // 2] * 0.6)
+    rows: list[list[dict]] = []
+    for c in sorted(comps, key=lambda t: (t["yc"], t["x0"])):
+        if rows and abs(c["yc"] - rows[-1][0]["yc"]) <= tol:
+            rows[-1].append(c)
+        else:
+            rows.append([c])
+    for r in rows:
+        r.sort(key=lambda t: t["x0"])
+    return rows
+
+
+def _grid_make_crop(im: Image.Image, c: dict) -> np.ndarray:
+    """字符裁剪：+3px padding；太窄的左右扩到 ≥ 0.55×高。
+
+    V3 的教训：12px 宽的裸格裁剪被 rec 压成 9×48，大面积读空；
+    左右扩宽后逐格召回立刻上来。
+    """
+    pad = 3
+    x0 = max(0, c["x0"] - pad)
+    x1 = min(im.width, c["x1"] + pad)
+    y0 = max(0, c["y0"] - pad)
+    y1 = min(im.height, c["y1"] + pad)
+    min_w = int((y1 - y0) * 0.55)
+    if x1 - x0 < min_w:
+        grow = (min_w - (x1 - x0)) / 2.0
+        x0 = max(0, int(x0 - grow))
+        x1 = min(im.width, int(x1 + grow) + 1)
+    return np.array(im.crop((x0, y0, x1, y1)))
+
+
+def recognize_raster_grid(image_bytes: bytes, timing: dict | None = None,
+                          engine=None) -> list[dict]:
+    """方案 A「网格通道」：跳过 det，连通域找字符格 → 逐格 rec。
+
+    返回与 det 通道同构的 OcrItem 列表（**每个字符一个 item**），
+    上层 omr.py 的 `_group_rows → _column_tokens → _row_tokens`
+    落格机制原样复用，仅对网格行放宽 D/T/S 硬门槛（require_dts=False）。
+
+    适用面：书页拍照谱（米色/纸纹底）。应用截图会被照片守卫拦下
+    （返回空列表，上层自动走 det 通道），本通道失败也不致命。
+    """
+    import time as _time
+
+    t0 = _time.time()
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return []
+    if im.width <= 0 or im.height <= 0:
+        return []
+    gray = np.array(im.convert("L"))
+
+    def _finish(items: list[dict]) -> list[dict]:
+        if timing is not None:
+            timing["grid_ms"] = int((_time.time() - t0) * 1000)
+        return items
+
+    # 照片守卫：应用截图不是本通道的战场（橙字在灰度下不可见是天然
+    # 保险，但白底判别是显式保险 —— 蓝色低声部在灰度下是暗的）。
+    if not _looks_like_photo(gray) and not _env_int("OCR_GRID_FORCE", 0):
+        return _finish([])
+
+    try:
+        comps, _stats = _grid_components(gray)
+    except Exception:  # noqa: BLE001 —— cv2 缺失等，网格通道整体让路
+        return _finish([])
+
+    # 行过滤：八度点行（矮、少）整行丢，谱面行（高）保留
+    rows = _grid_group_rows(comps)
+    if not rows:
+        return _finish([])
+    row_h = [float(np.median([c["h"] for c in r])) for r in rows]
+    h_max = max(row_h)
+    kept: list[dict] = []
+    for r, rh in zip(rows, row_h):
+        if len(r) < GRID_MIN_ROW_CHARS:
+            continue
+        if rh < h_max * GRID_ROW_H_RATIO:
+            continue
+        kept.extend(r)
+    if not kept:
+        return _finish([])
+
+    crops = [_grid_make_crop(im, c) for c in kept]
+    try:
+        eng = engine if engine is not None else _EngineAdapter(_load_engine())
+        results = eng.recognize(crops)
+    except Exception:  # noqa: BLE001 —— rec 失败，让路给 det 通道
+        return _finish([])
+
+    # 逐格 conf 普遍偏低（0.2~0.6），不能照搬 det 通道的 0.5 门槛：
+    # 丢一个字符 = 丢一个音，宁可交给用户在编辑器里改。
+    items: list[dict] = []
+    for c, res in zip(kept, results):
+        text = _grid_clean(res[0]) if res and res[0] else ""
+        if not text:
+            continue
+        items.append({
+            "text": text,
+            "x0": float(c["x0"]),
+            "x1": float(c["x1"]),
+            "yc": float(c["yc"]),
+            "h": float(c["h"]),
+        })
+    return _finish(items)

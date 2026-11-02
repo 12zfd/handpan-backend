@@ -162,6 +162,55 @@ class LocalRapidOcrProvider:
                 "unavailable", f"本地 OCR 识别失败：{exc}", retryable=True
             ) from exc
 
+    def recognize_full(self, image_bytes: bytes,
+                       timing: dict | None = None) -> dict:
+        """det 通道 + 网格通道（方案 A）一次跑完，共享同一个引擎。
+
+        返回 {"items": [...], "grid_items": [...]}：
+            items      —— det+rec 通道的 OcrItem（原有契约，不变）
+            grid_items —— 连通域逐格通道的 OcrItem（书页拍照谱专用；
+                          应用截图被照片守卫拦下，恒为空）
+
+        网格通道失败不致命（返回空），det 通道失败照常抛错。
+        """
+        if self.mode == "subproc":
+            from .ocr_worker import recognize_full_in_subprocess
+            data = recognize_full_in_subprocess(image_bytes, timing=timing)
+            return {"items": _decode_items(data.get("items") or []),
+                    "grid_items": _decode_items(data.get("grid_items") or [])}
+
+        try:
+            from .ocr_raster import (_EngineAdapter, _load_engine,
+                                     recognize_raster, recognize_raster_grid)
+        except ImportError as exc:  # pragma: no cover
+            raise OcrProviderError(
+                "unsupported", f"本地 OCR 模块不可用：{exc}"
+            ) from exc
+
+        try:
+            engine = _EngineAdapter(_load_engine())
+        except Exception as exc:  # noqa: BLE001
+            raise OcrProviderError(
+                "unavailable", f"本地 OCR 引擎启动失败：{exc}"
+            ) from exc
+
+        try:
+            items = _decode_items(
+                recognize_raster(image_bytes, timing=timing, engine=engine))
+        except OcrProviderError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise OcrProviderError(
+                "unavailable", f"本地 OCR 识别失败：{exc}", retryable=True
+            ) from exc
+
+        try:
+            grid_items = _decode_items(
+                recognize_raster_grid(image_bytes, timing=timing, engine=engine))
+        except Exception:  # noqa: BLE001 —— 网格通道失败不致命
+            grid_items = []
+        return {"items": items, "grid_items": grid_items}
+
     def recognize_legacy(self, image_bytes: bytes) -> list[dict]:
         """旧通道（整图一次检测+识别），保留用于对照与回归验证。
 
@@ -368,6 +417,12 @@ class CloudOcrProvider:
                 except Exception:  # noqa: BLE001
                     continue
         return out
+
+    def recognize_full(self, image_bytes: bytes,
+                       timing: dict | None = None) -> dict:
+        """云端 provider：网格通道不可用（恒空），只走 det 等价物。"""
+        return {"items": self.recognize(image_bytes, timing=timing),
+                "grid_items": []}
 
     # -- 主流程 -------------------------------------------------------
     def recognize(self, image_bytes: bytes,

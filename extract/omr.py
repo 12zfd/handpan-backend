@@ -155,13 +155,30 @@ def _engine():
 
 def _ocr_items(arr, timing: dict | None = None) -> list[dict]:
     """numpy 图像 / 图片字节 → [{"text","x0","x1","yc","h"}, ...]（兼容旧调用方）。"""
+    items, _grid = _ocr_items_full(arr, timing=timing)
+    return items
+
+
+def _ocr_items_full(arr, timing: dict | None = None) -> tuple[list[dict], list[dict]]:
+    """det 通道 + 网格通道（方案 A）一次取全。
+
+    返回 (items, grid_items)。云 provider 的 grid_items 恒为空；
+    本地 provider 两通道共享同一个引擎（inproc）或同一个子进程（subproc）。
+    """
     provider = get_provider()
+    fn = getattr(provider, "recognize_full", None)
     if isinstance(arr, (bytes, bytearray)):
-        return provider.recognize(bytes(arr), timing=timing)
+        if fn is not None:
+            data = fn(bytes(arr), timing=timing) or {}
+            return (data.get("items") or [], data.get("grid_items") or [])
+        return provider.recognize(bytes(arr), timing=timing), []
     # numpy 输入 → 先编码成 PNG 再交给 provider
     buf = io.BytesIO()
     Image.fromarray(np.asarray(arr)).save(buf, format="PNG")
-    return provider.recognize(buf.getvalue(), timing=timing)
+    if fn is not None:
+        data = fn(buf.getvalue(), timing=timing) or {}
+        return (data.get("items") or [], data.get("grid_items") or [])
+    return provider.recognize(buf.getvalue(), timing=timing), []
 
 
 def _run_ocr(path: Path) -> list[dict]:
@@ -503,6 +520,23 @@ def _row_left_margin(rows_chars: list[list[tuple[float, str, float]]]) -> float 
     return float(sorted(best)[len(best) // 2])
 
 
+def _left_from_row_mins(rows: list[list[dict]]) -> float | None:
+    """网格通道专用左边界：每行**最左字符 x0** 的中位数。
+
+    书页拍照谱每行都从同一条左边距起笔（实测 8 行最左字符全部落在
+    x≈95@1080），中位数对个别行首漏检鲁棒。
+
+    为什么 det 通道不能用：应用截图的**小节号列**（24/26/28…）比
+    音符列更靠左，取行最左会落到小节号上；det 通道继续用
+    `_page_left_from_boxes`（靠「首组是多字符框」区分小节号与音符）。
+    网格通道的行来自连通域行过滤，不含小节号列，行最左就是首组音符。
+    """
+    mins = [min(float(it["x0"]) for it in row) for row in rows if row]
+    if not mins:
+        return None
+    return float(sorted(mins)[len(mins) // 2])
+
+
 def _page_left_from_boxes(rows: list[list[dict]]) -> float | None:
     """只看文本框位置，估出谱面左边界（第一个音符格的 x0）。
 
@@ -554,7 +588,8 @@ def _row_tokens(row: list[dict],
                 segments: list[tuple[float, float, float, int]],
                 cell_w_hint: float | None = None,
                 left_hint: float | None = None,
-                chars: list[tuple[float, str, float]] | None = None) -> list[dict]:
+                chars: list[tuple[float, str, float]] | None = None,
+                require_dts: bool = True) -> list[dict]:
     """一行文本框 → [{"slot": 行内格位, "ch": 字符, "beams": 条数}, ...]
 
     **按物理坐标落格**，三个关键约定（全部来自对真机图谱面的实测）：
@@ -590,7 +625,12 @@ def _row_tokens(row: list[dict],
     #    于是 cursor 白推进 ROW_SLOTS(32) 格 —— 后面**每一行都错位一行**，
     #    这正是「输入图片后音节全部对不上」的顶层根因。
     #    谱面每个小节恒以 D/T/S（丁/叮/扫）开头，纯数字行绝不可能是谱面行。
-    if not any(c[1].upper() in ("D", "T", "S") for c in chars):
+    # ⚠️ 但该假设只对「丁/叮/扫记法」的原谱成立；书页拍照的简谱记法
+    #    （D Kurd 9音《晴天》实测）大量行是纯数字开头，整行没有 D/T/S。
+    #    网格通道（方案 A）的行来自像素连通域（按构造就是谱面行），
+    #    用 require_dts=False 放宽这条门槛，行筛选改由通道自身的
+    #    高度/字符数过滤承担。
+    if require_dts and not any(c[1].upper() in ("D", "T", "S") for c in chars):
         return []
 
     # 格宽必须用**全页统一值**。
@@ -631,7 +671,9 @@ def _row_tokens(row: list[dict],
 
 
 def _column_tokens(col: list[dict],
-                   segments: list[tuple[float, float, float, int]]
+                   segments: list[tuple[float, float, float, int]],
+                   require_dts: bool = True,
+                   left_mode: str = "boxes"
                    ) -> list[list[dict]]:
     """单栏（一列谱面）→ 逐行落格 tokens。
 
@@ -641,12 +683,19 @@ def _column_tokens(col: list[dict],
       2. 用格宽裁决重叠框（重复检测 / 跨组合并），需要格宽才能做
       3. 第二轮 `_row_chars(cell_w=格宽)` 重排字符 → 用首字符 x 众数精修 left
       4. 逐行 `_row_tokens` 落格
+
+    `require_dts=False`：网格通道（方案 A）专用 —— 书页简谱记法的
+    谱面行大量不含 D/T/S，门槛由通道自身的行过滤承担。
+    `left_mode="row_min"`：网格通道专用 —— 左边界取每行最左字符的
+    中位数（det 通道的「多字符框众数」假设对单字符网格框不成立，
+    实测会把左边界估到行中 x≈500，导致半行纯数字音符被当成小节号丢掉）。
     """
     rows = _group_rows(col)
     if not rows:
         return []
 
-    left_hint = _page_left_from_boxes(rows)
+    left_hint = (_left_from_row_mins(rows) if left_mode == "row_min"
+                 else _page_left_from_boxes(rows))
 
     def _row_chars_pass(cell_w: float | None) -> list[list[tuple[float, str, float]]]:
         out: list[list[tuple[float, str, float]]] = []
@@ -705,7 +754,8 @@ def _column_tokens(col: list[dict],
             out_rows.append([])
             continue
         toks = _row_tokens(row, segments, cell_w_hint=cell_w_hint,
-                           left_hint=left_hint, chars=chars)
+                           left_hint=left_hint, chars=chars,
+                           require_dts=require_dts)
         if toks:
             out_rows.append(toks)
     return out_rows
@@ -727,7 +777,7 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
     # OCR 与符杠检测必须用**同一张图**，否则两套坐标系对不上，
     # 符杠归属会全部错位。缩放后两张图共用同一坐标系，相对关系不变。
     proc_raw = _normalize(raw, MAX_IMAGE_WIDTH)
-    items = _ocr_items(proc_raw, timing=timing)
+    items, grid_items = _ocr_items_full(proc_raw, timing=timing)
     t1 = time.time()
 
     segments: list[tuple[float, float, float, int]] = []
@@ -742,7 +792,24 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
     #    单栏图切坏、或把双栏图切得更乱），这里只记录标记由上层告警。
     global _LAST_TWO_COLUMN
     _LAST_TWO_COLUMN = _detect_two_column(items)
-    rows_tokens = _column_tokens(items, segments)
+
+    # ── 双通道路由：det 通道（应用截图，历史校准）为主，
+    #    网格通道（方案 A，书页拍照谱）在**有效行更多**时接管。
+    #    实测 original_right.png：det 只还原 2 行（D 召回 0、后 4 行
+    #    整行丢），网格通道还原 8 行 → 路由正确择优。
+    #    应用截图：网格被照片守卫拦下（grid_items 空）→ 恒走 det。
+    det_rows = _column_tokens(items, segments)
+    rows_tokens = det_rows
+    if grid_items:
+        try:
+            grid_rows = _column_tokens(grid_items, segments, require_dts=False,
+                                       left_mode="row_min")
+        except Exception:  # noqa: BLE001 —— 网格通道失败不致命
+            grid_rows = []
+        g_valid = sum(1 for r in grid_rows if r)
+        d_valid = sum(1 for r in det_rows if r)
+        if g_valid >= 2 and g_valid > d_valid:
+            rows_tokens = grid_rows
     used_rows = len(rows_tokens)
     t2 = time.time()
 

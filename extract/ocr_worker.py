@@ -41,8 +41,13 @@ def _worker_main() -> int:
         from extract.ocr_provider import LocalRapidOcrProvider
         provider = LocalRapidOcrProvider()
         timing: dict = {}
-        items = provider.recognize(bytes(img_bytes), timing=timing)
-        out = {"ok": True, "items": items, "timing": timing}
+        # 双通道一次跑完（共享同一个引擎）：det 通道 + 网格通道（方案 A）。
+        # 网格通道自带照片守卫 —— 应用截图上它自己返回空，不浪费 rec 算力。
+        full = provider.recognize_full(bytes(img_bytes), timing=timing)
+        out = {"ok": True,
+               "items": full.get("items") or [],
+               "grid_items": full.get("grid_items") or [],
+               "timing": timing}
     except Exception as exc:  # noqa: BLE001
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     sys.stdout.write(json.dumps(out, ensure_ascii=False))
@@ -50,14 +55,9 @@ def _worker_main() -> int:
     return 0
 
 
-def recognize_in_subprocess(image_bytes: bytes, timeout: float = 120.0,
-                            timing: dict | None = None) -> list[dict]:
-    """在独立子进程里跑本地 OCR，返回 OcrItem 列表。
-
-    - 子进程每次都是全新的 → onnxruntime arena 不会跨任务累积
-    - 一个任务崩了也不影响主进程（OOM 只杀子进程）
-    - 峰值内存只属于那一个子进程，并发任务由上层信号量串行化
-    """
+def _run_subprocess(image_bytes: bytes, timeout: float,
+                    timing: dict | None) -> dict:
+    """在独立子进程里跑本地 OCR（双通道），返回完整结果 dict。"""
     import base64
 
     env = dict(os.environ)
@@ -111,6 +111,24 @@ def recognize_in_subprocess(image_bytes: bytes, timeout: float = 120.0,
         raise OcrProviderError("unavailable", f"OCR 子进程失败：{data.get('error')}")
     if timing is not None and isinstance(data.get("timing"), dict):
         timing.update(data["timing"])
+    return data
+
+
+def recognize_full_in_subprocess(image_bytes: bytes, timeout: float = 120.0,
+                                 timing: dict | None = None) -> dict:
+    """子进程双通道版：返回 {"items": [...], "grid_items": [...]}。"""
+    return _run_subprocess(image_bytes, timeout, timing)
+
+
+def recognize_in_subprocess(image_bytes: bytes, timeout: float = 120.0,
+                            timing: dict | None = None) -> list[dict]:
+    """在独立子进程里跑本地 OCR，返回 OcrItem 列表。
+
+    - 子进程每次都是全新的 → onnxruntime arena 不会跨任务累积
+    - 一个任务崩了也不影响主进程（OOM 只杀子进程）
+    - 峰值内存只属于那一个子进程，并发任务由上层信号量串行化
+    """
+    data = _run_subprocess(image_bytes, timeout, timing)
     return data.get("items") or []
 
 
