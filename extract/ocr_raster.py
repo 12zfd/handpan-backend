@@ -384,11 +384,114 @@ def _grid_clean(text: str) -> str:
     return str(text).translate(_GRID_CHAR_MAP).replace(" ", "").strip()
 
 
-def _grid_components(gray: np.ndarray) -> tuple[list[dict], dict]:
-    """二值化 + 连通域 → 主字符候选框（八度点/符杠/小节线已滤除）。"""
+# 彩色马克笔（用户手圈重点用的红笔）判据。
+# ⚠️ 用户会在书页上**用红笔圈出重点小节**，圈线常常直接压在音符上
+#    （实测《晴天》红圈把 `3` `4` 两个字整个盖住，且圈线从 y=112 一直
+#    连到 y=157，把两个字和上下两行音符全部粘成一个连通域 ——
+#    那个大块既不是长横线也不是长竖线，面积又远超主字符，被当成杂点
+#    丢掉，于是整小节两个音凭空不见、后面的音全部左移（用户看到的
+#    「导出的音节对不上」就是这么来的）。
+#    所以：**先把红笔像素单独剥出来**，不让它参与字符连通域，
+#    被红笔压住的笔画就用「同列上下最近墨迹」插值补回。
+GRID_RED_MIN = _env_int("OCR_GRID_RED_MIN", 110)     # R 下限，滤掉浅色纸纹
+GRID_RED_DELTA = _env_int("OCR_GRID_RED_DELTA", 40)  # R 比 G/B 至少高这么多
+
+
+def _red_mask(img_rgb: np.ndarray | None) -> np.ndarray | None:
+    """手写红笔像素（R 显著高于 G/B）。无彩色通道时返回 None。"""
+    if img_rgb is None or img_rgb.ndim != 3 or img_rgb.shape[2] < 3:
+        return None
+    r = img_rgb[:, :, 0].astype(np.int16)
+    g = img_rgb[:, :, 1].astype(np.int16)
+    b = img_rgb[:, :, 2].astype(np.int16)
+    return ((r >= GRID_RED_MIN)
+            & (r - g >= GRID_RED_DELTA)
+            & (r - b >= GRID_RED_DELTA))
+
+
+def _grid_ink_mask(gray: np.ndarray,
+                   img_rgb: np.ndarray | None = None) -> np.ndarray:
+    """灰度暗 → 墨迹（红笔请先经 _strip_red_pen 剥掉）。"""
+    _ = img_rgb
+    return gray < GRID_BIN_THRESHOLD
+
+
+def _strip_red_pen(gray: np.ndarray, red: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """剥掉手写红笔，并把它「压断的笔画」续回来。
+
+    为什么必须剥（实测《晴天》第 1 小节）：
+        红圈从 y=112 一路画到 y=157，**同时压住上面的 `2`、`3` `4`
+        和下面的 `D`**。红笔本来就是连通的，于是这些字被它串成一块
+        349×152 的巨型连通域（area=9690，主字符才 ~100），既不是长横线
+        也不是长竖线，最后被当成杂点整块丢掉 —— 第 1 小节因此少两个音，
+        后面所有音左移（用户看到的「音节对不上」）。
+        红笔 R≈245/G≈50/B≈16，灰度 ≈ 90，比阈值 150 还暗，
+        纯灰度二值化根本分不出来，必须用彩色判据。
+
+    做法：
+        1. 红像素在灰度图上填成 255（纸色），红圈从墨迹图里彻底消失；
+        2. 被红笔切断的笔画用「同列上下最近的墨迹」续回来（只续 ≤3px
+           的缺口，够接住笔画，不会把上下两行字粘在一起）。
+    返回 (修好的灰度图, 红笔掩码)。
+    """
+    if red is None or not red.any():
+        return gray, np.zeros_like(gray, dtype=bool)
+    fixed = gray.copy()
+    fixed[red] = 255
+    ink = (~red) & (gray < GRID_BIN_THRESHOLD)
+    ys, xs = np.nonzero(red)
+    for x in np.unique(xs):
+        col_red = np.nonzero(red[:, x])[0]
+        col_ink = np.nonzero(ink[:, x])[0]
+        if len(col_ink) == 0:
+            continue
+        for y in col_red:
+            k = np.searchsorted(col_ink, y)
+            cands = []
+            if k > 0:
+                cands.append(int(col_ink[k - 1]))
+            if k < len(col_ink):
+                cands.append(int(col_ink[k]))
+            if not cands:
+                continue
+            near = min(cands, key=lambda ci: abs(ci - y))
+            if abs(near - y) <= 3:      # 只续紧邻笔画，不跨行粘连
+                fixed[y, x] = gray[near, x]
+    return fixed, red
+
+
+def _grid_components(gray: np.ndarray,
+                     img_rgb: np.ndarray | None = None,
+                     red: np.ndarray | None = None) -> tuple[list[dict], dict]:
+    """二值化 + 连通域 → 主字符候选框（八度点/符杠/小节线已滤除）。
+
+    `gray` 必须是**已剥除红笔**的灰度图（见 _strip_red_pen）。
+    `img_rgb` / `red` 保留在签名里供调试用，内部不再依赖（红笔已在
+    _strip_red_pen 阶段处理干净）。
+    """
+    _ = img_rgb
     import cv2  # rapidocr 的传递依赖，缺失时网格通道整体让路
 
     binimg = (gray < GRID_BIN_THRESHOLD).astype(np.uint8)
+
+    # ── 切断红笔残留的「细连边」
+    # 剥红笔后，笔画周围常留下一圈 1~2px 的红墨抗锯齿残留（灰度仍 <150），
+    # 它们像胶水一样把 `3` `4` `D` 和上行小字粘成一整块 —— 实测若不处理，
+    # 仍会得到 349×152 的巨型连通域，字符全部消失。
+    # 判据：**只在红笔附近 ≤2px 内**，只切掉「腐蚀一次就消失」的 1px 细边；
+    # 离红笔远的正常笔画完全不受影响，应用截图/干净书页零改动。
+    if red is not None and red.any():
+        try:
+            k3 = np.ones((3, 3), np.uint8)
+            red_near = cv2.dilate(red.astype(np.uint8), k3, iterations=2).astype(bool)
+            eroded = cv2.erode(binimg, k3, iterations=1)
+            thin = binimg.astype(bool) & ~eroded.astype(bool)      # 1px 细边
+            cut = thin & red_near
+            if cut.any():
+                binimg = (binimg.astype(bool) & ~cut).astype(np.uint8)
+        except Exception:  # noqa: BLE001
+            pass
+
     n, _labels, stats, _cent = cv2.connectedComponentsWithStats(binimg, connectivity=8)
     comps: list[dict] = []
     for i in range(1, n):
@@ -503,25 +606,48 @@ def recognize_raster_grid(image_bytes: bytes, timing: dict | None = None,
         return _finish([])
 
     try:
-        comps, _stats = _grid_components(gray)
+        rgb = np.array(im)
+        red = _red_mask(rgb)
+        cleaned, red = _strip_red_pen(gray, red)
+        comps, _stats = _grid_components(cleaned, red=red)
     except Exception:  # noqa: BLE001 —— cv2 缺失等，网格通道整体让路
         return _finish([])
 
-    # 行过滤：八度点行（矮、少）整行丢，谱面行（高）保留
+    # ── 行过滤 + 上下声部标记
+    #
+    # 书页简谱是**双声部叠印**（实测用户《晴天》原谱）：
+    #     4        4 2 3 5 6   ← 上声部（字号小，yc 比下声部高 ~18px）
+    #     D 6 9 6  D 3 4 9 6   ← 下声部（正常字号）
+    # 上声部行「矮且少」，旧版按 GRID_ROW_H_RATIO 整行丢弃 →
+    # 导出的谱面只剩单声部（用户反馈「上下两个音，导出的没有」）。
+    #
+    # 现在改为：矮行不丢，打上 voice="upper" 交给上层合并成和弦；
+    # 只有「矮 + 字符太少」（真·八度点行）才丢。
     rows = _grid_group_rows(comps)
     if not rows:
         return _finish([])
     row_h = [float(np.median([c["h"] for c in r])) for r in rows]
     h_max = max(row_h)
     kept: list[dict] = []
+    upper_rows = 0
     for r, rh in zip(rows, row_h):
+        # 字符太少（真·八度点行 / 装饰点）整行丢
         if len(r) < GRID_MIN_ROW_CHARS:
             continue
         if rh < h_max * GRID_ROW_H_RATIO:
-            continue
+            # 矮行 = 上声部（叠印在谱面行上方的小字）。
+            # 实测上声部一行 4~7 个字符（等于和弦数），八度点行 ≤3 字符，
+            # 已被上面的字符数门槛挡掉。
+            for c in r:
+                c["voice"] = "upper"
+            upper_rows += 1
+        else:
+            for c in r:
+                c["voice"] = "lower"
         kept.extend(r)
     if not kept:
         return _finish([])
+    _stats["voice_upper_rows"] = upper_rows
 
     crops = [_grid_make_crop(im, c) for c in kept]
     try:
@@ -543,5 +669,7 @@ def recognize_raster_grid(image_bytes: bytes, timing: dict | None = None,
             "x1": float(c["x1"]),
             "yc": float(c["yc"]),
             "h": float(c["h"]),
+            # lower = 谱面主行；upper = 叠印在它上方的小字（和弦高音）
+            "voice": c.get("voice", "lower"),
         })
     return _finish(items)

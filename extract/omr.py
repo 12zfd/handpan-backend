@@ -241,13 +241,50 @@ def _resolve_overlaps(row: list[dict],
         narrow = min(float(a["x1"]) - float(a["x0"]), float(b["x1"]) - float(b["x0"]))
         return inter / max(1.0, narrow)
 
+    def _center(n: dict) -> float:
+        return (float(n["x0"]) + float(n["x1"])) / 2.0
+
+    def _real_dup(a: dict, b: dict) -> bool:
+        """是不是**同一个字被识别了两遍**（而不是两个挤在一起的相邻字）。
+
+        两种情况必须分开处理，否则要么漏音要么重音：
+          · 同一字符重复检测 → 中心 x 几乎重合（实测 <=3px），框高一致
+          · 两个相邻字符挤在一起 → 中心 x 相差 0.4~0.6 格（实测 25px），
+            且书页简谱里极常见（`3 4`、`1 4`、`S x`），它们是**两个音**
+
+        旧判据「x 区间重叠 > 25% 且密度更优者胜」在单字符框上失效：
+        单字符框宽只有 11~13px，两个相隔 25px 的相邻字靠框宽重叠不到，
+        但 **中间框（x0=318 x1=340，含 x/x 两字）** 一旦与右边单字框重叠，
+        就会按密度裁决把真音符整条丢掉 —— 实测红圈行 `3 4` 里的 `4`
+        就是这样消失的（第 1 小节因此少两个音，`9 6` 提前到 13/15 格）。
+
+        判据：中心距 <= max(4.0, 0.22 * 格宽) 才算重复。
+        实测重复检测中心差 <=1px；相邻字中心差 >=23px（格宽 23.5 时为 5.2px），
+        两档分得很开，不会互相误判。
+        """
+        lim = max(4.0, 0.22 * cw) if cw > 0 else 4.0
+        if abs(_center(a) - _center(b)) > lim:
+            return False
+        ha = float(a.get("h") or 0.0)
+        hb = float(b.get("h") or 0.0)
+        # 高度差太大说明一个是叠印小字，不当重复（保险），但声部已分开，理论上不会走到
+        return not (ha > 0 and hb > 0 and abs(ha - hb) / max(ha, hb) > 0.35)
+
     kept: list[dict] = []
     for it in sorted(row, key=lambda t: float(t["x0"])):
-        clash = [k for k in kept if _overlap(it, k) > 0.25]
+        # ⚠️ 只在**同一声部内**裁决重叠。
+        #    上下叠印的双声部字符（4 压在 D 上）x 区间天然 100% 重叠，
+        #    它们是两个真实的音（和弦），不是同一字符的重复识别。
+        #    若跨声部裁决，会把上层音当成重复检测整条丢掉 ——
+        #    这正是「上下两个音，导出的没有」的直接原因。
+        voice = it.get("voice") or "lower"
+        clash = [k for k in kept
+                 if (k.get("voice") or "lower") == voice
+                 and _real_dup(it, k)]
         if not clash:
             kept.append(it)
             continue
-        # 与所有冲突者比，自己是更优就替换掉它们
+        # 真·重复检测：与所有冲突者比，自己是更优就替换掉它们
         mine = _score(it)
         if all(mine <= _score(k) for k in clash):
             kept = [k for k in kept if k not in clash]
@@ -328,16 +365,49 @@ def _is_polluted_row(items: list[dict]) -> bool:
 
 
 def _group_rows(items: list[dict]) -> list[list[dict]]:
+    """按 yc 聚行。网格通道的上声部（voice="upper"）会先挂到下方主行上。
+
+    双声部叠印（书页简谱）：
+        4        4 2 3   ← upper（yc 比主行高 ~18px）
+        D 6 9 6  D 3 4   ← lower（主行）
+    若按 yc 单维聚行，upper 与 lower 相差 18px > tol(≈11px) → 各成一行，
+    upper 行会被上层当作独立谱面行，导致行数/小节数翻倍。
+    所以这里先按 voice 分开：lower 照常聚行，upper 按最近的 lower 行
+    归并（只在网格通道出现 voice 字段时生效，det 通道行为不变）。
+    """
     if not items:
         return []
     heights = sorted(it["h"] for it in items if it["h"] > 0)
     tol = (heights[len(heights) // 2] if heights else 20) * 0.6
+
+    has_voice = any(it.get("voice") for it in items)
+    if has_voice:
+        low = [it for it in items if it.get("voice") != "upper"]
+        up = [it for it in items if it.get("voice") == "upper"]
+    else:
+        low, up = items, []
+
     rows: list[list[dict]] = []
-    for it in sorted(items, key=lambda t: t["yc"]):
+    for it in sorted(low, key=lambda t: t["yc"]):
         if rows and abs(it["yc"] - rows[-1][0]["yc"]) <= tol:
             rows[-1].append(it)
         else:
             rows.append([it])
+
+    # 上声部：挂到 yc 最接近、且在主行**上方**的那一行（容差放宽到 2.4×tol，
+    # 实测 dy 恒为 -17.5~-18.8px，tol≈11px）。挂不上的丢掉（孤立的装饰字）。
+    if up and rows:
+        row_y = [float(sorted(t["yc"] for t in r)[len(r) // 2]) for r in rows]
+        for it in up:
+            dy_max = tol * 2.4
+            best_i, best_dy = -1, None
+            for i, ry in enumerate(row_y):
+                dy = ry - float(it["yc"])       # >0 表示主行在下方
+                if 0 < dy <= dy_max and (best_dy is None or dy < best_dy):
+                    best_i, best_dy = i, dy
+            if best_i >= 0:
+                rows[best_i].append(it)
+
     for r in rows:
         r.sort(key=lambda t: float(t["x0"]))
     # 重叠框裁决要等全页格宽估出来才能做（密度判据依赖格宽），
@@ -365,8 +435,13 @@ def _clean(text: str) -> str:
 
 def _row_chars(row: list[dict],
                cell_w: float | None = None,
-               left: float | None = None) -> list[tuple[float, str, float]]:
-    """一行文本框 → [(字符中心x, 字符, 字符宽), ...]，按 x 排序。
+               left: float | None = None) -> list[tuple[float, str, float, str]]:
+    """一行文本框 → [(字符中心x, 字符, 字符宽, 声部), ...]，按 x 排序。
+
+    声部（voice）：lower = 谱面主行；upper = 叠印在主行上方的小字（和弦高音）。
+    det 通道的 item 没有 voice 字段，一律视为 lower。
+    ⚠️ 必须在这里透传，不能在下游按 x 范围反查 —— 上下叠印的两个音
+    x 几乎完全重合，反查会命中错的框（实测 4 与 D 相邻时 voice 互相串）。
 
     OCR 会把相邻几个字符合并成一个文本框（如 "TXXDXDXD"）。
     框内每个字符的真实 x 未知，用**全页格宽**（cell_w）推进最准：
@@ -375,7 +450,7 @@ def _row_chars(row: list[dict],
     `left` 传入时，位于谱面左边界**左侧**（小节号列）的纯数字框会被丢弃。
     这是唯一可靠的小节号判据 —— 靠文本格式判断会误杀音符组。
     """
-    chars: list[tuple[float, str, float]] = []
+    chars: list[tuple[float, str, float, str]] = []
     for it in row:
         t = it["text"].replace(" ", "").strip()
         if not t:
@@ -390,9 +465,10 @@ def _row_chars(row: list[dict],
             continue
         x0 = float(it["x0"])
         x1 = float(it["x1"])
+        voice = it.get("voice") or "lower"
         n = len(cleaned)
         if n == 1:
-            chars.append(((x0 + x1) / 2.0, cleaned, max(x1 - x0, 1.0)))
+            chars.append(((x0 + x1) / 2.0, cleaned, max(x1 - x0, 1.0), voice))
             continue
         # 框内字符按等距排布。核心模型是**左端锚定 + 格宽推进**：
         #     cx0 = x0 + pitch/2      （第一格中心 = 框左沿 + 半格）
@@ -438,7 +514,7 @@ def _row_chars(row: list[dict],
                 gx0 = x0 + span * g0 / float(n)
                 gcx0 = gx0 + cell_w / 2.0
                 for i, ch in enumerate(grp):
-                    chars.append((gcx0 + i * cell_w, ch, cell_w))
+                    chars.append((gcx0 + i * cell_w, ch, cell_w, voice))
             continue
         if not (cell_w and cell_w > 0):
             pitch = span / n if n else 1.0
@@ -450,8 +526,10 @@ def _row_chars(row: list[dict],
             pitch = cell_w            # 正常单组：左端锚定 + 格宽
         cx0 = x0 + pitch / 2.0
         for i, ch in enumerate(cleaned):
-            chars.append((cx0 + i * pitch, ch, pitch))
-    chars.sort(key=lambda c: c[0])
+            chars.append((cx0 + i * pitch, ch, pitch, voice))
+    # 排序：x 优先；x 几乎重合时 **lower 在前** —— 上层音随后落到同格，
+    # 由 _row_tokens 的「异声部→和弦」分支合进同一格。
+    chars.sort(key=lambda c: (round(c[0] / 3.0), c[3] == "upper"))
     return chars
 
 
@@ -651,22 +729,53 @@ def _row_tokens(row: list[dict],
 
     out: list[dict] = []
     beams_of = [(it, count_beams(it, segments)) for it in row]
+    # 每个 slot 已占的音符（用于区分「同格叠印和弦」与「并排撞格顺延」）
+    occupied: dict[int, list[dict]] = {}
     last_slot = -1
-    for x, ch, _cw in chars:
-        # 找到该字符所属的文本框，取它的符杠条数
+
+    for item in chars:
+        x, ch, _cw = item[0], item[1], item[2]
+        # 声部来自 _row_chars 透传（不能再按 x 反查：上下叠印 x 重合会串）
+        voice = item[3] if len(item) > 3 else "lower"
+        # 符杠条数仍需按 x 反查文本框（同 voice 的框 x 不重合，安全）
         beams = 0
         for it, b in beams_of:
+            if (it.get("voice") or "lower") != voice:
+                continue
             if float(it["x0"]) - 1.0 <= x <= float(it["x1"]) + 1.0:
                 beams = b
                 break
         slot = int(round((x - x_ref) / cell_w))
         slot = max(0, slot)
-        if slot <= last_slot:
-            slot = last_slot + 1
         if slot >= ROW_SLOTS:
             break
-        out.append({"slot": slot, "ch": ch, "beams": beams})
-        last_slot = slot
+
+        # ── 和弦判定：同 slot 已有音符时，不无脑顺延 ──────────────
+        # 书页简谱是**上下叠印双声部**，同一格上下各一个音（如 4 压在 D 上）。
+        # 旧逻辑 `if slot <= last_slot: slot = last_slot + 1` 会把上层音
+        # 顺延到下一格（或直接丢在 break 之后），和弦整个消失。
+        # 新逻辑：
+        #   · 已有音符与该字符**声部不同**（upper vs lower）→ 同格共存 = 和弦
+        #   · 同声部（都是主行，OCR 把两个字符判到同一格）→ 顺延，不丢字
+        if slot in occupied:
+            same_voice = any(o.get("voice") == voice for o in occupied[slot])
+            if same_voice or len(occupied[slot]) >= 2:
+                # 同声部撞格 → 顺延到下一个空格
+                slot = max(slot, last_slot + 1)
+                while slot in occupied:
+                    slot += 1
+                if slot >= ROW_SLOTS:
+                    break
+            else:
+                # 异声部 → 真和弦，同格共存
+                pass
+
+        tok = {"slot": slot, "ch": ch, "beams": beams, "voice": voice}
+        out.append(tok)
+        occupied.setdefault(slot, []).append(tok)
+        last_slot = max(last_slot, slot)
+
+    out.sort(key=lambda t: (t["slot"], t.get("voice") == "upper"))
     return out
 
 

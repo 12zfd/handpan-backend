@@ -88,7 +88,13 @@ def _decode_items(raw_items: list[dict]) -> list[dict]:
             continue
         if x1 < x0:
             x0, x1 = x1, x0
-        out.append({"text": text, "x0": x0, "x1": x1, "yc": yc, "h": h})
+        item = {"text": text, "x0": x0, "x1": x1, "yc": yc, "h": h}
+        # 网格通道的双声部标记必须原样透传：上层音（voice="upper"）与
+        # 主行音 x 重合，丢掉这个字段上游就无法把上下两音合成和弦，
+        # 会退化成「上层单独成行 → 被行过滤丢弃 → 和弦消失」。
+        if it.get("voice"):
+            item["voice"] = str(it["voice"])
+        out.append(item)
     return out
 
 
