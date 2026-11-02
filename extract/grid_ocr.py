@@ -124,7 +124,7 @@ def _ocr_char(img: Image.Image) -> str:
         if engine == "pytesseract":
             import pytesseract
             txt = ""
-            for psm in (10, 8):
+            for psm in (10, 8, 6):
                 txt = pytesseract.image_to_string(
                     img, lang="eng",
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789DdSs",
@@ -145,6 +145,123 @@ def _ocr_char(img: Image.Image) -> str:
 
 
 # ── OpenCV 几何切分 ──────────────────────────────────────────────
+def _erase_circles(binimg: np.ndarray) -> np.ndarray:
+    """擦掉带圈数字（①⑤③…）的外圈，只留圈里的数字给 OCR。
+
+    手碟谱常用 ①-⑨ 标音位，RapidOCR / tesseract 对带圈字形基本全瞎。
+    判据：外轮廓有且只有一个子轮廓（洞）、外框近正方形且 14~70px、
+    子轮廓（圈内内容）bbox 明显小于外框（数字 0/8 的洞几乎和外面一样大，
+    会被这条排除）、外圈面积接近外框（圆是凸的）。
+    """
+    import cv2
+    try:
+        cnts, hier = cv2.findContours(binimg, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hier is None or len(cnts) == 0:
+            return binimg
+        hier = hier[0]
+        out = binimg.copy()
+        n = len(cnts)
+        children: dict[int, list[int]] = {}
+        for j in range(n):
+            children.setdefault(int(hier[j][3]), []).append(j)
+        for i in range(n):
+            if hier[i][3] == -1 or len(children.get(i, [])) != 1:
+                continue                      # 只处理「有且仅有一个洞」的外圈
+            x, y, w0, h0 = cv2.boundingRect(cnts[i])
+            if w0 < 14 or h0 < 14 or w0 > 70 or h0 > 70:
+                continue
+            ar = w0 / float(h0)
+            if ar < 0.65 or ar > 1.55:
+                continue
+            if cv2.contourArea(cnts[i]) < 0.5 * w0 * h0:
+                continue                      # 圈是凸的；破损圈不擦
+            cx, cy, cw, ch = cv2.boundingRect(cnts[children[i][0]])
+            if cw > 0.72 * w0 or ch > 0.72 * h0:
+                continue                      # 数字 0/8 的洞几乎和外面一样大
+            cv2.drawContours(out, [cnts[i]], -1, 0, thickness=3)
+        return out
+    except Exception:  # noqa: BLE001 —— 擦圈失败不影响切格
+        return binimg
+
+
+def _band_columns(v_lines: np.ndarray, y0: int, y1: int, w: int) -> list[int]:
+    """在单个行带内独立找竖直节拍线 → 列边界。
+
+    谱册（多行系统排版）里节拍线只跨本行带，全页累计根本够不到门槛 ——
+    这是《天空之城》这类谱册整页空白的根因。每行带用自己的竖线，
+    互不对齐也能切。
+    """
+    band_h = y1 - y0
+    prof = v_lines[y0:y1, :].sum(axis=0)
+    thr = 255 * max(8, band_h // 3)
+    cand = [int(x) for x in np.nonzero(prof > thr)[0]]
+    return _cluster(cand, max(6, w // 200))
+
+
+def _cluster_row(binimg: np.ndarray, h_lines: np.ndarray, full_v_cols: list[int],
+                 y0: int, y1: int, w: int) -> list[dict]:
+    """墨迹簇兜底切分：行带内没有竖线刻度时，直接按列墨迹聚簇 → 逐簇 OCR。
+
+    《天空之城》这类谱册的节拍刻度在形态学竖线输出里根本不存在，
+    只能放弃「找线切格」，改为「找字切格」：扣除横线和页边框后，
+    列墨迹画像上的每个连续簇就是一个字符（或音名组合），逐簇交给 OCR。
+    """
+    ya, yb = max(0, y0), min(binimg.shape[0], y1)
+    band = binimg[ya:yb, :].copy()
+    # 抹掉横线与贯穿全页的竖线（页边框/系统分隔线）
+    band[h_lines[ya:yb, :] > 0] = 0
+    for x in full_v_cols:
+        band[:, max(0, x - 6):x + 7] = 0
+    col = band.sum(axis=0) / 255
+    nz = col > 6
+    runs: list[list[int]] = []
+    x = 0
+    while x < len(nz):
+        if nz[x]:
+            s = x
+            while x < len(nz) and nz[x]:
+                x += 1
+            runs.append([s, x])
+        else:
+            x += 1
+    if not runs:
+        return []
+    min_gap = max(12, w // 80)
+    merged = [runs[0]]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] < min_gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+
+    max_w = w // 12          # 超过这个宽度的簇多半是标题/和弦名整行，不认
+    mid = y0 + (y1 - y0) // 2
+    toks: list[dict] = []
+    for ci, (s, e) in enumerate(merged):
+        if e - s < 8 or e - s > max_w:
+            continue
+        crop_full = band[:, max(0, s - 2):e + 2]
+        ys, xs = np.nonzero(crop_full)
+        if len(ys) < MIN_CELL_INK or ys.max() - ys.min() < 8:
+            continue
+        crop = crop_full[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        ch_img = Image.fromarray(255 - crop.astype(np.uint8))
+        scale = max(2, CELL_TARGET_H // max(1, ch_img.height))
+        if scale > 1:
+            ch_img = ch_img.resize((ch_img.width * scale, ch_img.height * scale), Image.LANCZOS)
+        ch_img = ch_img.point(lambda v: 255 if v > 200 else 0)
+        padded = Image.new("L", (ch_img.width + 16, ch_img.height + 16), 255)
+        padded.paste(ch_img, (8, 8))
+        ch = _ocr_char(padded)
+        if not ch:
+            continue
+        if ch == "0":
+            continue             # 手碟音位是 1-9/D/S；'0' 多是小节辅助数字
+        voice = "upper" if (int(ys.min()) + ya) < mid else "lower"
+        toks.append({"slot": ci, "ch": ch, "beams": 0, "voice": voice})
+    return toks if len(toks) >= 2 else []
+
+
 def _to_gray(raw: bytes) -> tuple[np.ndarray, np.ndarray]:
     """bytes → (gray, colored_mask)。colored_mask=True 的像素是彩色底（非墨迹）。"""
     im = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -206,15 +323,19 @@ def _recognize_grid_impl(raw: bytes) -> list[list[dict]] | None:
     if h_lines.sum() < 255 * 50 or v_lines.sum() < 255 * 50:
         return None                      # 线太少：这不是网格谱，走上层兜底
 
+    # 擦掉带圈数字的外圈（①-⑨ → 裸数字），必须在切格/OCR 之前
+    binimg = _erase_circles(binimg)
+
     # 行带：横线 y 聚类，相邻两条横线夹出一个谱面行
     row_ys = _cluster([int(y) for y in np.nonzero(h_lines.sum(axis=1) > 255 * (w // 10))[0]],
                       max(6, h // 120))
-    # 列边界：竖线 x 聚类
+    # 全页对齐的列边界（仅作行带内找不到竖线时的兜底）
     col_xs = _cluster([int(x) for x in np.nonzero(v_lines.sum(axis=0) > 255 * (h // 10))[0]],
                       max(6, w // 120))
-    if len(col_xs) < MIN_COLS or len(row_ys) < 2:
+    col_xs_full = list(col_xs)       # 全页贯穿竖线（页边框等），供墨迹簇兜底扣除
+    if len(row_ys) < 2:
         return None
-    col_xs = col_xs[:MAX_COLS + 1]
+    col_xs = col_xs[:MAX_COLS + 1] if len(col_xs) >= MIN_COLS else []
     if len(row_ys) > MAX_ROWS + 1:
         row_ys = row_ys[:MAX_ROWS + 1]
 
@@ -224,10 +345,10 @@ def _recognize_grid_impl(raw: bytes) -> list[list[dict]] | None:
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))) > 0
 
     engine = _pick_engine()
-    med_w = float(np.median(np.diff(col_xs))) if len(col_xs) > 2 else float(w)
 
     rows_tokens: list[list[dict]] = []
     chars_found = 0
+    cols_total = 0
 
     for ri in range(len(row_ys) - 1):
         y0, y1 = row_ys[ri], row_ys[ri + 1]
@@ -235,10 +356,25 @@ def _recognize_grid_impl(raw: bytes) -> list[list[dict]] | None:
         if band_h < 24:                  # 太矮不是谱行（装饰线/页眉）
             continue
         mid = y0 + band_h // 2
+        # 行带内独立找列边界；找不到再用全页对齐的（老网格截图谱）
+        cols = _band_columns(v_lines, y0, y1, w)
+        if len(cols) - 1 < 3:
+            cols = col_xs
+        n_cols = min(len(cols) - 1, MAX_COLS)
+        if n_cols < 3:
+            # 墨迹簇兜底：行带内既没有自己的竖线、全页列也对不上时，
+            # 直接按列墨迹聚簇切字（谱册无竖线刻度的布局）
+            row_toks = _cluster_row(binimg, h_lines, col_xs_full, y0, y1, w)
+            if row_toks:
+                chars_found += len(row_toks)
+                cols_total += len(row_toks)
+                rows_tokens.append(row_toks)
+            continue
+        cols_total += n_cols
         row_toks: list[dict] = []
-        n_cols = min(len(col_xs) - 1, MAX_COLS)
+        med_w = float(np.median(np.diff(cols))) if len(cols) > 2 else float(w)
         for ci in range(n_cols):
-            x0, x1 = col_xs[ci], col_xs[ci + 1]
+            x0, x1 = cols[ci], cols[ci + 1]
             cell_w = x1 - x0
             if cell_w < 8 or cell_w > med_w * 4:
                 continue                 # 过宽过窄都是非谱面竖线
@@ -283,7 +419,7 @@ def _recognize_grid_impl(raw: bytes) -> list[list[dict]] | None:
         _LAST_INFO.update({
             "engine": engine or "none",
             "rows": len(rows_tokens),
-            "cols": len(col_xs) - 1,
+            "cols": cols_total // max(1, len(rows_tokens)),
             "chars": chars_found,
         })
 
