@@ -129,6 +129,75 @@ def _ocr_crop(binimg: np.ndarray, x0: int, y0: int, x1: int, y1: int,
     return _ocr_char(padded)
 
 
+def _count_holes(crop: np.ndarray) -> int:
+    """数字块内部封闭孔洞数（背景被墨完全包围）。
+
+    0=无孔(1/2/3/5/7)  1=6/0/9/闭4  2=8。
+    用于纠正 5↔6 形近混淆：'6' 有底环孔，'5' 无孔——这是几何特征，
+    比 tesseract 对印刷小字的随机 OCR 稳定得多。
+    """
+    if crop.size == 0:
+        return 0
+    import cv2
+    cnts, hier = cv2.findContours(
+        (crop > 0).astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None or len(cnts) == 0:
+        return 0
+    hier = hier[0]
+    hh, ww = crop.shape[:2]
+    total_ink = int((crop > 0).sum())
+    min_hole = max(4, total_ink * 0.04)      # 过滤噪点小孔
+    holes = 0
+    for j in range(len(cnts)):
+        if hier[j][3] == -1:
+            continue  # 外轮廓，不是孔
+        if cv2.contourArea(cnts[j]) < min_hole:
+            continue
+        # 只认完全被墨包围的孔：贴到裁块边缘的「伪孔」（数字与圈之间的空隙）不计。
+        # 这一步对带圈数字尤其重要——否则圈与数字之间的缝隙会被数成假孔。
+        bx, by, bw, bh = cv2.boundingRect(cnts[j])
+        if bx <= 0 or by <= 0 or bx + bw >= ww or by + bh >= hh:
+            continue
+        holes += 1
+    return holes
+
+
+def _ocr_digit(binimg: np.ndarray, x0: int, y0: int, x1: int, y1: int,
+               target_h: int = 52):
+    """二值图裁块 → 单字符 OCR + 内部孔洞数（同 _ocr_crop，但多返回 holes）。"""
+    from .grid_ocr import _ocr_char
+    crop = binimg[max(0, y0):y1, max(0, x0):x1]
+    ys, xs = np.nonzero(crop)
+    if len(ys) < 12:
+        return "", 0
+    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+    tight = crop[cy0:cy1, cx0:cx1]
+    holes = _count_holes(tight)
+    img = Image.fromarray(255 - tight.astype(np.uint8))
+    scale = max(2, target_h // max(1, img.height))
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+    img = img.point(lambda v: 255 if v > 200 else 0)
+    padded = Image.new("L", (img.width + 16, img.height + 16), 255)
+    padded.paste(img, (8, 8))
+    return _ocr_char(padded), holes
+
+
+def _fix_digit(ch: str, holes: int, crop_h: int) -> str:
+    """用孔洞数纠正 5↔6 形近混淆（带圈数字 / 底行数字通用）。
+
+    · 恰好 1 个孔且字高足够 → 必不是 5（5 无孔），判为 6；
+    · 无孔且字高足够（环本应可见，crop_h≥30）→ 判为 5。
+      小字（带圈数字）阈值可能破环，故小字不做 6→5，避免误伤真 6。
+    """
+    if ch == "5" and holes == 1 and crop_h >= 20:
+        return "6"
+    if ch == "6" and holes == 0 and crop_h >= 30:
+        return "5"
+    return ch
+
+
 # ── 主解析 ───────────────────────────────────────────────────────
 
 def parse_rl_score(raw: bytes, debug: bool = False) -> list[list[dict]] | None:
@@ -264,6 +333,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             by_slot[si] = main
     bass: list[tuple[int, str]] = []
     miss = 0
+    bass_holes: dict[int, int] = {}
     for si in range(32):
         main = by_slot.get(si)
         if main is None:
@@ -271,8 +341,10 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             miss += 1
             continue
         _, _, x, y, ww, hh = main
-        ch = _ocr_crop(binimg, x, by0 + y, x + ww, by0 + y + hh, target_h=52)
+        ch, holes = _ocr_digit(binimg, x, by0 + y, x + ww, by0 + y + hh, target_h=52)
+        ch = _fix_digit(ch, holes, hh)
         bass.append((si, ch))
+        bass_holes[si] = holes
         if not ch:
             miss += 1
     n_bass = 0
@@ -281,6 +353,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             tok = {"slot": si, "ch": ch, "beams": 0, "voice": "lower"}
             if debug:
                 tok["_src"] = "bass"
+                tok["_holes"] = bass_holes.get(si, 0)
             tokens.append(tok)
             n_bass += 1
 
@@ -305,7 +378,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             continue
         hx, hy, hw, hh2 = r["hole"]
         pad = max(1, min(hw, hh2) // 14)
-        inner = _ocr_crop(binimg, hx + pad, hy + pad, hx + hw - pad, hy + hh2 - pad, target_h=52)
+        inner, holes = _ocr_digit(binimg, hx + pad, hy + pad, hx + hw - pad, hy + hh2 - pad, target_h=52)
         whole = _ocr_crop(binimg, r["x0"], r["y0"], r["x1"], r["y1"], target_h=52)
         # 圈内/整圈任一认出合法字符（1-9 或 D/S）即可；优先取数字，
         # 没数字再取 D/S。D 的空碗因洞偏右上已被居中约束排除，不会进 rings。
@@ -318,6 +391,9 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             ch = inner
         elif whole_ok:
             ch = whole
+        if ch in "56":
+            # 5↔6 用孔洞数定夺：带圈数字小字不反向修（避免破环误伤真 6）
+            ch = _fix_digit(ch, holes, hh2 - 2 * pad)
         if not ch or ch == "0":
             continue
         slot = slot_of(r["cx"])
@@ -328,6 +404,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
         tok = {"slot": slot, "ch": ch, "beams": 0, "voice": voice}
         if debug:
             tok["_src"] = "R" if voice == "upper" else "L"
+            tok["_holes"] = int(holes)
         tokens.append(tok)
         n_note += 1
 
