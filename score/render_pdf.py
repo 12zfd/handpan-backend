@@ -75,11 +75,31 @@ def _setup_page():
 
 
 def _cells_of(score_json: dict) -> int:
+    """每小节格数。
+
+    ★ 不能只信 grid.cells —— 历史数据里有 grid.cells 缺失/回退成 12、
+      但 events 实际落在 slot 14/15 的情况（OMR 通道恒产 16 格）。
+      只按 12 画会把每小节最后 4 格整体裁掉，表现为「导出 PDF 比网页里
+      鼓点少一大截、音节对不上」。这里以**实际出现过的最大 slot** 兜底，
+      保证一个音符都不会被静默丢弃。
+    """
     grid = score_json.get("grid") or {}
     try:
         n = int(grid.get("cells") or SYSTEM["cells"])
     except (TypeError, ValueError):
         n = SYSTEM["cells"]
+
+    # 兜底：以真实 slot 的最大值为准（+1 才是格数）
+    deepest = -1
+    for bar in score_json.get("bars") or []:
+        for ev in bar.get("events") or []:
+            try:
+                deepest = max(deepest, int(ev.get("slot") or 0))
+            except (TypeError, ValueError):
+                continue
+    if deepest >= n:
+        n = deepest + 1
+
     return max(4, min(n, 24))
 
 

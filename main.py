@@ -643,12 +643,19 @@ def download(
     score_id: int,
     user: Annotated[User, Depends(current_user_from_header_or_query)],
     db: Annotated[Session, Depends(get_db)],
+    name: str | None = Query(default=None, alias="name", max_length=120),
 ):
+    """下载 PDF。
+
+    `?name=` 可选：手机端（iOS「存储到文件」/ Android「下载」）会拿这个
+    当保存后的文件名。前端本地出稿时用的是「歌名_D Kurd 9音.pdf」，
+    这里也接受同名参数，保证「网页看到的名字」和「存到手机的名字」一致。
+    """
     s = db.get(Score, score_id)
     if s is None or not s.pdf_url:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "PDF 尚未生成")
 
-    name = _pdf_name(s)
+    name = _safe_pdf_name(name) or _pdf_name(s)
 
     # 同域代理：服务端拉取对象存储（S3/R2）字节后直接回传，浏览器只与后端通信。
     # 避免浏览器跨域直连 Supabase（国内链路不稳、跨域重定向在部分网络/浏览器下会被拦），
@@ -685,6 +692,24 @@ def download(
 def _pdf_name(s: Score) -> str:
     base = (s.title or f"score-{s.id}").replace("/", "_").replace("\\", "_")
     return f"{base}_D Kurd 9音_{s.created_at:%Y%m%d}.pdf"
+
+
+def _safe_pdf_name(raw: str | None) -> str | None:
+    """清洗前端传来的文件名。
+
+    只保留安全字符，强制 .pdf 后缀，丢掉路径分隔符 —— 这个值会进
+    Content-Disposition 头，不能让换行/引号之类的字符混进去造成头注入。
+    """
+    if not raw:
+        return None
+    base = os.path.basename(str(raw).replace("\\", "/")).strip()
+    base = re.sub(r"[\r\n\t\"'<>|:*?/\\]", "", base)
+    base = base.strip(". ")
+    if not base:
+        return None
+    if not base.lower().endswith(".pdf"):
+        base += ".pdf"
+    return base[:120]
 
 
 @app.get("/files/{score_id}/original")

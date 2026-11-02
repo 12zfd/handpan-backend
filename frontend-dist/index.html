@@ -230,6 +230,18 @@ function mm2px(mm){ return mm * DPI / 25.4; }
 function cellsOf(sj){
   var n = 16;
   try { n = parseInt((sj.grid && sj.grid.cells) || 16, 10) || 16; } catch(e){}
+  // 兜底：以实际出现过的最大 slot 为准（与 render_pdf.py::_cells_of 一致）。
+  // 只看 grid.cells 会在它缺失/回退成 12 时，把每小节最后 4 格整体裁掉。
+  var deepest = -1;
+  var bars = (sj && sj.bars) || [];
+  for(var i = 0; i < bars.length; i++){
+    var evs = (bars[i] && bars[i].events) || [];
+    for(var j = 0; j < evs.length; j++){
+      var s = parseInt(evs[j].slot || 0, 10);
+      if(s > deepest) deepest = s;
+    }
+  }
+  if(deepest >= n) n = deepest + 1;
   return Math.max(4, Math.min(n, 24));
 }
 
@@ -346,10 +358,32 @@ function canvasesToPdf(canvases, title){
   }
   function toJpeg(cv){
     var dataUrl = cv.toDataURL("image/jpeg", 0.92);
-    var b64 = dataUrl.split(",")[1];
-    var bin = atob(b64), u = new Uint8Array(bin.length);
-    for(var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-    return u;
+    // 不能假定一定返回 "data:image/jpeg;base64,xxx"：
+    // 某些环境（含部分 WebView）返回未编码 URL，甚至导出失败返回 "data:,"。
+    // 直接 split(',')[1] 会拿到 undefined → atob 抛错 → 整个本地出稿链路中断，
+    // 表现为「点了下载没反应/退回服务器出稿」。这里逐层兜底。
+    if(!dataUrl || dataUrl.indexOf(",") < 0)
+      throw new Error("画布导出失败，无法生成 PDF");
+    var head = dataUrl.slice(0, dataUrl.indexOf(","));
+    var body = dataUrl.slice(dataUrl.indexOf(",") + 1);
+    if(!body) throw new Error("画布导出为空，无法生成 PDF");
+    if(head.indexOf("base64") >= 0){
+      var bin;
+      try{ bin = atob(body); }
+      catch(e){ throw new Error("画布数据解码失败：" + e.message); }
+      var u = new Uint8Array(bin.length);
+      for(var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      return u;
+    }
+    // 非 base64 的 dataURL：按百分号编码逐字节还原
+    try{
+      var dec = decodeURIComponent(body);
+      var u2 = new Uint8Array(dec.length);
+      for(var j = 0; j < dec.length; j++) u2[j] = dec.charCodeAt(j) & 0xFF;
+      return u2;
+    }catch(e){
+      throw new Error("画布数据格式无法识别，无法生成 PDF");
+    }
   }
   var n = canvases.length;
   var W = Math.round(mm2px(PAGE.w) * 72 / DPI * 100) / 100;  // pt
@@ -432,44 +466,226 @@ return { downloadLocalPdf: downloadLocalPdf, buildPdfBlob: buildPdfBlob,
 })();
 
 /* ---- 下载触发 ----
-   桌面：浏览器本地用 canvas 画 PDF，a.download 直接存盘（零网络、瞬时）。
-   移动端：应用内网页环境（含微信/App 内嵌浏览器）无法把 blob 存到本机文件系统，
-           所以改为「跳转到手机原生浏览器」打开后端 /download 真实链接，
-           由原生浏览器负责下载（系统会弹保存确认 = 用户同意）。
+   核心：PDF 一律在**浏览器本地**生成（谱面数据在手，零网络往返），
+   然后把 Blob 交给「最有可能真的存下来」的那条通道，而不是赌后端链接可用。
+
+   通道优先级（自动选，用户可在弹层里改选）：
+     1. 原生浏览器 + 支持 a[download]  → 直接 a.download（iOS 会弹「存储到文件」）
+     2. 原生浏览器 + 不支持 download    → 新窗口打开 blob（可「分享→存储」）
+     3. 应用内 WebView（微信/飞书/App）→ 引导「在浏览器中打开」，或在页内触发下载
+   任何情况下都由用户点击触发，符合「经用户同意」。
 */
-function mobileOpenNative(id){
-  var t = token();
-  var url = BACKEND + '/download/' + encodeURIComponent(id) + (t ? ('?token=' + encodeURIComponent(t)) : '');
-  var w = window.open(url, '_blank');   // 必须在点击事件同步阶段调用，才不会被当弹窗拦
-  if(!w){
-    // 弹窗被拦：页内模态 + 真实可点链接（用户手动点 = 真手势，原生浏览器会下载）
-    showPdfModal(url);
+var PDF_ENV = (function(){
+  var ua = navigator.userAgent || "";
+  var isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  var isAndroid = /Android/i.test(ua);
+  var isMobile = isIOS || isAndroid || /webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  // 应用内浏览器特征：这些环境下 blob 通常存不进本机文件
+  var inApp = /MicroMessenger|WeChat|QQ\/|QQBrowser|Weibo|Alipay|DingTalk|Feishu|Lark|FBAN|FBAV|Instagram|Line\//i.test(ua);
+  // a[download] 支持度：iOS Safari 13+ / Android Chrome 都支持
+  var supportsDL = ("download" in document.createElement("a"));
+  return { isIOS:isIOS, isAndroid:isAndroid, isMobile:isMobile,
+           inApp:inApp, supportsDL:supportsDL, ua:ua };
+})();
+
+/* 把 Blob 存成本机文件：返回 true 表示「已尝试真实下载」 */
+function saveBlob(blob, filename){
+  try{
+    if(PDF_ENV.supportsDL){
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = filename; a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 20000);
+      return true;
+    }
+    // 不支持 download：新窗口打开 blob（原生浏览器可长按/分享保存）
+    var u2 = URL.createObjectURL(blob);
+    var w = window.open(u2, "_blank");
+    if(w) return true;
+    URL.revokeObjectURL(u2);
+    return false;
+  }catch(e){
+    return false;
   }
 }
 
-function showPdfModal(url){
-  var ov = document.getElementById('pdf-modal');
-  if(!ov){
-    ov = document.createElement('div');
-    ov.id = 'pdf-modal';
-    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
-    ov.innerHTML =
-      '<div style="background:#fff;border-radius:12px;max-width:480px;width:100%;max-height:90vh;overflow:auto;padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.3)">'+
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'+
-          '<b style="font-size:16px">PDF 下载</b>'+
-          '<span id="pdf-modal-close" style="cursor:pointer;font-size:22px;line-height:1;padding:4px 8px">×</span>'+
-        '</div>'+
-        '<p style="font-size:13px;color:#666;margin:0 0 12px">浏览器将打开下载页，请在原生浏览器中用「分享 → 存储到文件」保存。</p>'+
-        '<a id="pdf-modal-open" href="#" target="_blank" rel="noopener" style="display:block;text-align:center;background:#667eea;color:#fff;text-decoration:none;padding:14px;border-radius:8px;font-size:15px;font-weight:600">📂 打开 / 保存到文件</a>'+
-        '<p style="font-size:12px;color:#999;margin:10px 0 0">若按钮无效，可长按上方链接选择「下载链接文件」。</p>'+
-      '</div>';
-    document.body.appendChild(ov);
-    ov.addEventListener('click', function(ev){
-      if(ev.target.id === 'pdf-modal-close' || ev.target === ov) ov.remove();
+/* 应用内 WebView：把本地 PDF 也挂成可长按的链接 + 给出「在浏览器打开」出路 */
+function showPdfModal(blob, filename, fallbackUrl){
+  var ov = document.getElementById("pdf-modal");
+  if(ov) ov.remove();
+
+  ov = document.createElement("div");
+  ov.id = "pdf-modal";
+  // ★ box-sizing 必须显式写：全局若有 *{box-sizing:border-box} 之外的规则，
+  //   在 390px 窄屏上 padding 会被叠加到 100% 宽度之外，弹层右侧被裁掉。
+  ov.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;-webkit-overflow-scrolling:touch";
+  ov.innerHTML =
+    '<div style="background:#fff;border-radius:12px;max-width:480px;width:100%;max-height:90vh;overflow:auto;padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.3);box-sizing:border-box;-webkit-overflow-scrolling:touch">'+
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'+
+        '<b style="font-size:16px;color:#111">保存 PDF 到手机</b>'+
+        '<span id="pdf-modal-close" style="cursor:pointer;font-size:22px;line-height:1;padding:4px 12px">×</span>'+
+      '</div>'+
+      '<div style="background:#FFF7E6;border:1px solid #FFE0A3;border-radius:8px;padding:10px 12px;margin-bottom:14px">'+
+        '<p style="font-size:13px;color:#8A5A00;margin:0;line-height:1.65">'+
+          '<b>应用内浏览器无法把文件存进手机。</b><br>'+
+          '<span id="pdf-modal-hint"></span>'+
+        '</p>'+
+        '<p id="pdf-modal-linkline" style="font-size:12px;color:#8A5A00;margin:8px 0 0;line-height:1.6">'+
+          'PDF 直链（复制后粘到手机浏览器）：<br>'+
+          '<span id="pdf-modal-url" style="display:inline-block;max-width:100%;word-break:break-all;text-decoration:underline"></span>'+
+        '</p>'+
+      '</div>'+
+      '<button id="pdf-modal-copy" style="display:block;width:100%;border:0;background:#667eea;color:#fff;padding:14px;border-radius:8px;font-size:15px;font-weight:600;margin-bottom:10px;cursor:pointer">📋 复制 PDF 直链</button>'+
+      '<button id="pdf-modal-save" style="display:block;width:100%;border:1.5px solid #c7d0f5;background:#fff;color:#4c5fd5;padding:13px;border-radius:8px;font-size:15px;font-weight:600;margin-bottom:10px;cursor:pointer">📥 仍然试一下直接下载</button>'+
+      '<a id="pdf-modal-open" href="#" style="display:block;text-align:center;color:#4c5fd5;text-decoration:underline;font-size:13px;padding:8px">或：点击这里尝试交给系统浏览器打开</a>'+
+      '<p id="pdf-modal-tip" style="font-size:12px;color:#999;margin:12px 0 0;line-height:1.6"></p>'+
+    '</div>';
+  document.body.appendChild(ov);
+
+  ov.querySelector("#pdf-modal-hint").textContent = outOfWebviewHint();
+  // 直链：优先后端稳定链接（原生浏览器能直接下），没有就退回 blob（仅本页可看）
+  var directUrl = fallbackUrl || "";
+  var blobUrl = blob ? URL.createObjectURL(blob) : "";
+  if(!directUrl){
+    ov.querySelector("#pdf-modal-linkline").style.display = "none";
+    ov.querySelector("#pdf-modal-copy").style.display = "none";
+  }
+  ov.querySelector("#pdf-modal-url").textContent = directUrl;
+
+  // ① 复制直链：手机上最可靠的一步（粘到系统浏览器地址栏 = 100% 真下载）
+  var copyBtn = ov.querySelector("#pdf-modal-copy");
+  if(copyBtn){
+    copyBtn.addEventListener("click", function(){
+      var tip = ov.querySelector("#pdf-modal-tip");
+      copyText(directUrl).then(function(ok){
+        tip.textContent = ok ? "已复制。切到手机浏览器，粘贴到地址栏回车即可下载。"
+                             : "复制失败，请长按上面的链接手动复制。";
+      });
     });
   }
-  ov.querySelector('#pdf-modal-open').href = url;
-  ov.style.display = 'flex';
+
+  // ② 直接下载：再试一次 a[download]（部分 WebView 允许）
+  ov.querySelector("#pdf-modal-save").addEventListener("click", function(){
+    if(!blob){ ov.querySelector("#pdf-modal-tip").textContent = "请用上面的直链在浏览器中下载。"; return; }
+    var ok = saveBlob(blob, filename);
+    ov.querySelector("#pdf-modal-tip").textContent = ok
+      ? "已提交下载。若跳出选择框，请选「存储到文件 / 保存」。"
+      : "当前环境不支持直接下载，请复制直链用手机浏览器打开。";
+  });
+
+  // ③ 交给系统浏览器：应用内环境基本会被拦，这里只是让用户多一次尝试
+  ov.querySelector("#pdf-modal-open").href = directUrl || blobUrl || "#";
+  ov.querySelector("#pdf-modal-open").target = "_blank";
+  ov.querySelector("#pdf-modal-open").rel = "noopener";
+  // ④ 长按链接：blob 在多数 WebView 里长按可「下载链接文件」
+  if(blobUrl){
+    ov.querySelector("#pdf-modal-url").setAttribute("data-blob", blobUrl);
+  }
+
+  ov.addEventListener("click", function(ev){
+    if(ev.target.id === "pdf-modal-close" || ev.target === ov){
+      if(blobUrl) URL.revokeObjectURL(blobUrl);
+      ov.remove();
+    }
+  });
+}
+
+/* 剪贴板：先现代 API，再 execCommand 兜底（微信内 execCommand 更稳） */
+function copyText(text){
+  if(!text) return Promise.resolve(false);
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(text)
+      .then(function(){ return true; })
+      .catch(function(){ return legacyCopy(text); });
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+function legacyCopy(text){
+  try{
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    var ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }catch(e){ return false; }
+}
+
+/* 统一入口：本地出稿 → 依环境选择通道
+   scoreJson: 谱面 JSON；baseName: 文件名前缀；fallbackUrl: 后端 /download 链接（可空） */
+function deliverPdf(scoreJson, baseName, fallbackUrl){
+  var blob, name;
+  // ★ buildPdfBlob / safeName 都定义在 HP 那个 IIFE **内部**，全局拿不到。
+  //   必须走 HP.buildPdfBlob，否则这里 ReferenceError → 静默退化成
+  //   「后端链接」分支，手机上就表现为「点了没反应」。
+  try{
+    blob = HP.buildPdfBlob(scoreJson, baseName);   // 本地渲染，不依赖服务器
+    var nm = String(baseName || 'score').replace(/[\\\/:*?"<>|]/g, '_');
+    name = nm + "_D Kurd 9音.pdf";
+  }catch(e){
+    // 本地渲染失败（数据不完整）：退回后端链接
+    if(fallbackUrl){
+      var w0 = window.open(fallbackUrl, "_blank");
+      if(!w0) showPdfModal(new Blob(["%PDF-1.4\n%%EOF"], {type:"application/pdf"}), "score.pdf", fallbackUrl);
+      return { mode:"server", name:null };
+    }
+    throw e;
+  }
+
+  // 应用内 WebView：直接给三种出路，不赌
+  if(PDF_ENV.inApp){
+    showPdfModal(blob, name, fallbackUrl);
+    return { mode:"modal", name:name };
+  }
+
+  var ok = saveBlob(blob, name);
+  if(!ok){
+    showPdfModal(blob, name, fallbackUrl);
+    return { mode:"modal", name:name };
+  }
+  return { mode:"download", name:name };
+}
+
+/* ---- 后端链接（原生浏览器直开可下载；应用内 WebView 里只能当兜底）---- */
+function backendPdfUrl(id, base){
+  // 注意：本文件在**顶层**还有一段独立的 IIFE（L657 起），里面有另一个
+  // BACKEND / token()。本函数也活在顶层，不能直接引用那边的变量，
+  // 否则运行到这里就 ReferenceError: token is not defined。
+  // ★ BACKEND 只存在于下面那个 IIFE 里，顶层引用不到（typeof 守卫会静默
+  //   退化成 location.origin —— 在 file:// 或独立静态站上就成了
+  //   file:///download/17，手机原生浏览器打开必然 404）。
+  //   这里显式写死后端地址：它就是 Render 上的固定服务地址。
+  var origin = 'https://handpan-backend.onrender.com';
+  var t = '';
+  try{
+    t = localStorage.getItem('hsf_token') ||
+        localStorage.getItem('hsf_token'.toUpperCase()) || '';
+  }catch(e){ t = ''; }
+  // safeName 在顶层 IIFE 里面，这里就地带一份，避免再次踩作用域坑
+  var nm = String(base || ('score-' + id)).replace(/[\\\/:*?"<>|]/g, '_');
+  var u = origin + '/download/' + encodeURIComponent(id) +
+          '?name=' + encodeURIComponent(nm + '_D Kurd 9音.pdf');
+  if(t) u += '&token=' + encodeURIComponent(t);
+  return u;
+}
+
+/* 应用内 WebView 的「冲出沙箱」入口：微信/QQ/钉钉/飞书 都提供系统级
+   「在浏览器中打开」，这条路能让用户在原生浏览器里真正下载 + 保存。
+   返回值仅作提示，不保证可调用（各家 JS 桥不同）。 */
+function outOfWebviewHint(){
+  if(/MicroMessenger|WeChat/i.test(PDF_ENV.ua)) return '右上角 ··· →「在浏览器打开」，再点一次「下载 PDF」即可保存到手机。';
+  if(/QQ\//i.test(PDF_ENV.ua))                return '右上角 ··· →「在浏览器打开」，再点一次「下载 PDF」即可保存到手机。';
+  if(/DingTalk/i.test(PDF_ENV.ua))            return '右上角 ··· →「在浏览器中打开」，再点一次「下载 PDF」即可保存。';
+  if(/Feishu|Lark/i.test(PDF_ENV.ua))         return '右上角 ··· →「用默认浏览器打开」，再点一次「下载 PDF」即可保存。';
+  return '点右上角菜单 →「在浏览器中打开」，再下载一次即可保存到手机。';
 }
 
 function triggerDownload(blob, filename){
@@ -500,7 +716,9 @@ var BACKEND = 'https://handpan-backend.onrender.com';
 var MAX_FILES = 5;
 var IMAGE_EXT = /\.(jpe?g|png)$/i;
 var MIDI_MAP = {1:50,2:57,3:58,4:60,5:62,6:64,7:65,8:67,9:69};
-var DEFAULT_CELLS = 12;
+var DEFAULT_CELLS = 16;   // 与 extract/omr.py::SLOTS_PER_BAR 一致（4 拍 × 16 分音符）。
+                          // 曾写 12（老样张遗留）：grid.cells 缺失时会裁掉每小节最后 4 格，
+                          // 表现为网页预览和导出 PDF 都「少音、音位对不上」。
 var SYS_H = 70;
 var MID_TOP = 35;
 var SYS_GAP = 67;
@@ -1079,32 +1297,30 @@ function renderRows(){
 }
 
 async function downloadRow(id){
-  var ua = navigator.userAgent || "";
-  var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
-  // 移动端：跳转到原生浏览器下载（应用内网页环境存不了本机文件）
-  if(isMobile){
-    mobileOpenNative(id);
-    setNotice('ok','已打开下载窗口，请在浏览器中确认保存');
-    return;
-  }
   var row = S.rows.filter(function(r){ return r.id===id; })[0];
   var base = ((row && row.title) || ('score-'+id)).replace(/[\\/:*?"<>|]/g,'_');
-  // 优先本地出稿：先拉谱面 JSON（一次轻量请求，顺带唤醒后端），
-  // 浏览器直接画 PDF —— 服务器不再渲染/传输 PDF 本体。
+  var fb = backendPdfUrl(id, base);
+
+  // ① 先把谱面数据拿到手（一次轻量请求），本地出稿 = 与网页预览逐格一致
+  var sj = null;
   try{
     var d = await api.detail(id);
-    if(d && d.midi_data_json && (d.midi_data_json.bars||[]).length){
-      var name = HP.downloadLocalPdf(d.midi_data_json, base);
-      setNotice('ok','已本地出稿：'+name);
+    sj = (d && d.midi_data_json) || null;
+    if(sj && !base) base = sj.title || base;
+  }catch(e){ /* 拿不到就退回后端出稿 */ }
+
+  if(sj && (sj.bars||[]).length){
+    try{
+      var r = deliverPdf(sj, base, fb);
+      if(r.mode === 'download') setNotice('ok','已保存到本机：'+r.name);
+      else if(r.mode === 'modal') setNotice('ok','已生成 PDF：'+r.name);
       return;
-    }
-  }catch(localErr){ /* 拉取或本地渲染失败 → 回退服务器出稿 */ }
-  try{
-    var name2 = await api.downloadPdf(id, base+'_D Kurd 9音.pdf');
-    setNotice('ok','已开始下载：'+name2);
-  }catch(e){
-    setNotice('err', e.message);
+    }catch(e){ /* 本地渲染异常 → 退后端 */ }
   }
+
+  // ② 后端兜底：外链 + 允许带上文件名
+  var w = window.open(fb, '_blank');
+  if(!w) showPdfModal(null, base + '_D Kurd 9音.pdf', fb);
 }
 
 /* ------------------------------------------------------------------ 轮询 */
@@ -1666,33 +1882,25 @@ async function applyTempo(){
   }
 }
 
-async function downloadPreviewPdf(){
+function downloadPreviewPdf(){
   var p = pv();
   if(!p) return;
-  var ua = navigator.userAgent || "";
-  var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
-  // 移动端：跳转到原生浏览器下载（应用内网页环境存不了本机文件）
-  if(isMobile){
-    mobileOpenNative(p.id);
-    setNotice('ok','已打开下载窗口，请在浏览器中确认保存');
-    return;
-  }
   var base = ((p.data && p.data.title) || ('score-'+p.id)).replace(/[\\/:*?"<>|]/g,'_');
-  // 优先本地出稿：预览页手头就有完整谱面数据，浏览器直接画 PDF，
-  // 不经过服务器（Render Free 冷启动 + 0.1 CPU 是下载慢的根源）。
+  var fb = backendPdfUrl(p.id, base);
+
+  // 预览页手头就有完整谱面数据 → 直接把「你看到的那张谱」画成 PDF，
+  // 不经过服务器，所以导出的音符/音位与网页预览逐格一致。
   try{
-    var name = HP.downloadLocalPdf(p.data, base);
-    setNotice('ok','已本地出稿（0 网络请求）：'+name);
+    var r = deliverPdf(p.data, base, fb);
+    if(r.mode === 'download') setNotice('ok','已保存到本机：'+r.name);
+    else if(r.mode === 'modal') setNotice('ok','已生成 PDF：'+r.name);
+    else setNotice('ok','已打开后端下载链接，请在浏览器中确认保存');
     return;
   }catch(localErr){
-    // 数据不完整等原因本地失败，回退服务器出稿
+    // 数据不完整等原因本地失败，回退服务器出稿（带文件名）
   }
-  try{
-    await api.downloadPdf(p.id, base+'_D Kurd 9音.pdf');
-  }catch(e){
-    p.err = e.message;
-    renderPreview();
-  }
+  var w = window.open(fb, '_blank');
+  if(!w) showPdfModal(null, base + '_D Kurd 9音.pdf', fb);
 }
 
 /* ------------------------------------------------------------------ 启动 */

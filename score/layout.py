@@ -21,7 +21,10 @@ SYSTEM = {
     "pitch": 39.5,         # 行距（中线到中线）
     "first_mid_y": 59.8,   # 第一行中线距页顶
     "bars": 2,
-    "cells": 12,           # 每小节格数（可由 score_json.grid.cells 覆盖）
+    "cells": 16,           # 每小节格数（可由 score_json.grid.cells 覆盖）
+                           # 16 = 4 拍 × 16 分音符，与 extract/omr.py 的
+                           # SLOTS_PER_BAR 严格一致。曾写 12（老样张遗留），
+                           # 导致 grid.cells 缺失时每小节最后 4 格被裁掉。
 }
 
 NOTE = {
