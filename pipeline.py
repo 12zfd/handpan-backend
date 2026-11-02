@@ -111,8 +111,15 @@ def run_pipeline(score_id: int) -> None:
         elif score.source_type == "image":
             t_img = time.time()
             with _OCR_LOCK:
-                # 分段计时：图片解码 / OCR 推理 / 结果格式化
-                tab = image_to_tab(raw, timing=_Timing())
+                try:
+                    # 分段计时：图片解码 / OCR 推理 / 结果格式化
+                    tab = image_to_tab(raw, timing=_Timing())
+                except Exception as exc:  # noqa: BLE001
+                    # 识别引擎崩了也**绝不抛**：落空结果，让下面的空白兜底接管。
+                    # （需求 4：绝不允许因为异常导致用户看到纯空白或任务失败）
+                    traceback.print_exc()
+                    tab = {"events": [], "bars": None, "bpm": 120.0,
+                           "warnings": [f"识别引擎异常（{str(exc)[:120]}），已生成空白谱格，请在预览页手动录入"]}
             note_events = tab.get("events") or []
             bpm = tab.get("bpm") or 120.0
             bars_hint = tab.get("bars")
@@ -140,10 +147,16 @@ def run_pipeline(score_id: int) -> None:
             if extra_warnings:
                 score_json["warnings"] = extra_warnings + score_json["warnings"]
         elif score.source_type == "image":
-            # 一个字符都没读出来：给一张空白谱格，让用户手动录入（兜底路径）
-            score_json = empty_score(bars=12, bpm=120, source="image",
+            # 一个字符都没读出来（含 OCR 引擎异常 / OpenCV 兜底也没救回）：
+            # 强制返回 4/4 拍 8 小节空白手碟谱 + status="fallback" 提示，
+            # 用户在预览页手动录入。绝不允许空白/异常透出到前端。
+            score_json = empty_score(bars=8, bpm=120, source="image",
                                      title=score.title or "D Kurd 9音")
-            score_json["warnings"] = extra_warnings + ["未识别到音符，请在预览页手动录入"]
+            score_json["status"] = "fallback"
+            score_json["message"] = "未能精准识别，已为你生成空白网格，请手动输入"
+            score_json["warnings"] = extra_warnings + [
+                "未能精准识别，已为你生成 4/4 拍 8 小节空白网格，请手动输入",
+            ]
         else:
             _set(db, score, status="failed",
                  error_message="未识别到有效音符，建议换更清晰的素材或改用手动录入")

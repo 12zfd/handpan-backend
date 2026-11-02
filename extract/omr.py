@@ -72,6 +72,9 @@ except ValueError:
     MAX_IMAGE_WIDTH = 1080
 
 SCORE_CHARS = re.compile(r"^[0-9DXxTtSsDd|Il]{1,}$")
+
+# 网格兜底通道（extract/grid_ocr.py）最近一次的元信息；None = 未启用。
+_LAST_RESCUE: dict | None = None
 # 小节号：纯数字，1~2 位（原谱行首编号 24、26、28…；末行会有 5 这种 1 位）。
 # ⚠️ 千万不能用 ^\d{2,}$ —— 谱面里的音符组大量是纯数字
 #    （9876 / 7876 / 5654 / 3456 …），会被整组当成小节号丢掉，
@@ -919,6 +922,28 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
         d_valid = sum(1 for r in det_rows if r)
         if g_valid >= 2 and g_valid > d_valid:
             rows_tokens = grid_rows
+
+    # ── 第三通道（兜底）：主通道一个有效行都没有时，
+    #    用纯 OpenCV 网格切分 + 单元格 OCR 再救一次。
+    #    场景：Render 上 OCR 引擎崩/内存不足/彩色底干扰 —— 只要图上有
+    #    网格线就能把音挖出来。识别不到网格或一个字都没认出则返回 None，
+    #    由上层（pipeline）落空白谱兜底。
+    if not any(rows_tokens):
+        try:
+            from .grid_ocr import last_info, recognize_grid
+            rescue = recognize_grid(proc_raw)
+            if rescue:
+                rows_tokens = rescue
+                info = last_info()
+                global _LAST_RESCUE
+                _LAST_RESCUE = {
+                    "engine": info.get("engine"),
+                    "rows": info.get("rows"),
+                    "cols": info.get("cols"),
+                    "chars": info.get("chars"),
+                }
+        except Exception:  # noqa: BLE001 —— 兜底通道失败不致命
+            pass
     used_rows = len(rows_tokens)
     t2 = time.time()
 
@@ -968,8 +993,9 @@ def image_to_tab(raw: bytes | list[bytes],
     empty_pages = 0
 
     # 每次调用重置污染行计数（多页时跨页累加）
-    global _LAST_DROPPED_ROWS
+    global _LAST_DROPPED_ROWS, _LAST_RESCUE
     _LAST_DROPPED_ROWS = 0
+    _LAST_RESCUE = None
 
     t_fmt0 = time.time()
     for pi, page in enumerate(pages):
@@ -1035,6 +1061,13 @@ def image_to_tab(raw: bytes | list[bytes],
         "时值按输入图的横线排：无横线=1 格、一条=2 格、两条=4 格（横线越多音越长）",
         f"排布结果 {cursor} 格 ≈ {bars} 小节（应与原谱一致；有偏差说明横线检测有误，请对照原图校对）",
     ]
+    if _LAST_RESCUE:
+        warnings.append(
+            "整页 OCR 没读出有效行，已用 OpenCV 网格切分兜底识别"
+            f"（引擎={_LAST_RESCUE.get('engine') or '无'}，"
+            f"{_LAST_RESCUE.get('rows', 0)} 行 × {_LAST_RESCUE.get('cols', 0)} 格，"
+            f"认出 {_LAST_RESCUE.get('chars', 0)} 字）。兜底通道只认单元格内主字，"
+            "横线时值一律按 1 格算，请对照原图校对。")
     if _LAST_TWO_COLUMN:
         warnings.append(
             "这张图是双栏排版（左右两栏谱面并排）。双栏图的字符顺序在 OCR "

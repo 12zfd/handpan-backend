@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg libsndfile1 fonts-noto-cjk \
+        ffmpeg libsndfile1 fonts-noto-cjk tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

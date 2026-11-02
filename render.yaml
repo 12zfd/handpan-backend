@@ -5,7 +5,10 @@ services:
     runtime: python
     plan: free                 # 免费层 0.1 CPU / 512MB：分块 det + 子进程 OCR 已实测峰值 322MB，可跑
     repo: https://github.com/12zfd/handpan-backend
-    buildCommand: pip install -r requirements.txt
+    # tesseract-ocr 是 pytesseract 的系统级依赖（单元格兜底 OCR 用）。
+    # 用 `;` 而不是 `&&`：apt 万一失败也保证 pip 继续装 Python 依赖，
+    # 代码里引擎缺失会自动降级，服务照常起。
+    buildCommand: apt-get update -y; apt-get install -y tesseract-ocr; pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     disk:
