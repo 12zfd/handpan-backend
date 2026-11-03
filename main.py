@@ -822,5 +822,48 @@ def version():
         return {"build": ""}
 
 
+@app.get("/build-info")
+def build_info():
+    """后端部署版本指纹 —— 用来确认线上跑的是不是最新那次推送的代码。
+
+    Render 每次 push 都会重新构建，但没有官方的「当前 commit」接口，
+    于是把关键文件的内容哈希 + 源码里记录的版本号一起返回：
+    线上验收脚本据此断言「新功能真的上线了」，而不是只看 healthz 200。
+    """
+    import hashlib
+
+    def _fp(rel: str) -> str:
+        try:
+            b = (BASE_DIR / rel).read_bytes()
+        except OSError:
+            return ""
+        return hashlib.sha256(b).hexdigest()[:12]
+
+    files = {
+        "extract/rl_score.py": _fp("extract/rl_score.py"),
+        "extract/grid_ocr.py": _fp("extract/grid_ocr.py"),
+        "extract/omr.py": _fp("extract/omr.py"),
+        "score/note_mapper.py": _fp("score/note_mapper.py"),
+        "score/layout.py": _fp("score/layout.py"),
+        "score/render_pdf.py": _fp("score/render_pdf.py"),
+    }
+    # 能力探针：源码里出现这些符号 = 新版能力已上线
+    caps = {}
+    try:
+        rl = (BASE_DIR / "extract" / "rl_score.py").read_text(encoding="utf-8")
+        go = (BASE_DIR / "extract" / "grid_ocr.py").read_text(encoding="utf-8")
+        ly = (BASE_DIR / "score" / "layout.py").read_text(encoding="utf-8")
+        caps = {
+            "rl_slot_anchors": "_slot_anchors" in rl,
+            "rl_merge_split": "_merge_split_groups" in rl,
+            "rl_dp_assign": "_dp_assign_slots" in rl,
+            "tesseract_discovery": "_find_tesseract" in go,
+            "three_lane_bass": "bass_drop_mm" in ly,
+        }
+    except OSError:
+        pass
+    return {"files": files, "caps": caps, "ts": int(time.time())}
+
+
 if DIST.is_dir():
     app.mount("/", StaticFiles(directory=str(DIST), html=True), name="frontend")
