@@ -102,37 +102,33 @@ def build_score(
         tap_count = 0
         tap_label = "S"
         tap_beams = 0
+        tap_lane = None
         for n in ev:
             if n.get("pitch") is None:      # S / X / T：无音高敲击，保留时值、不落音位
                 tap_count += 1
                 tap_label = n.get("label") or "S"
                 tap_beams = int(n.get("beams") or 0)
+                if n.get("lane"):
+                    tap_lane = n["lane"]
                 continue
             m = map_pitch(int(round(n["pitch"])))
             if m is None:
                 dropped += 1
             else:
+                # 底行（bass）是低音区：音位不变（导出的数字与输入一致），
+                # 但音高折低一个八度，三条泳道才不会撞在同一个音高上。
+                if n.get("lane") == "bass":
+                    m["midi"] = int(m["midi"]) - 12
                 if n.get("label"):
                     m["label"] = n["label"]
                 if n.get("beams"):
                     m["beams"] = int(n["beams"])
+                if n.get("lane"):
+                    m["lane"] = n["lane"]
                 mapped.append(m)
         if not mapped and not tap_count:
             continue
 
-        uniq: dict[int, dict] = {}
-        for m in mapped:
-            uniq.setdefault(m["pos"], m)
-        ordered = sorted(uniq.values(), key=lambda m: m["midi"])
-
-        if len(ordered) > MAX_SIMULTANEOUS:
-            over_limit += 1
-
-        # 两档模型（用户规则）：上档橙、下档蓝，不再有中档；S 也可上可下
-        #   1 个音      → 上档
-        #   2 个音      → 高音上档、低音下档
-        #   1 个音 + S  → 音在上档、S 在下档
-        #   只有 S      → S 上档
         slot_abs = int(round(ev[0]["start"] / sec_per_slot))
         if slot_abs < 0:
             continue
@@ -144,11 +140,16 @@ def build_score(
         cell = grid.setdefault((bar_idx, slot), {"bar": bar_idx, "slot": slot, "notes": []})
 
         def _lane(hand: str, note: dict) -> None:
-            if any(x.get("pos") == note.get("pos") and x.get("kind") == note.get("kind")
+            # 去重键必须带 hand —— 三泳道版式里，同一小节格内
+            # 「R 的 3」和「底行的 3」是两个不同的音位（底行折低八度），
+            # 只按 pos+kind 去重会把底行那个误删（底行音符凭空消失）。
+            if any(x.get("hand") == hand and x.get("pos") == note.get("pos")
+                   and x.get("kind") == note.get("kind")
                    for x in cell["notes"]):
                 return
             note["hand"] = hand
-            note["color"] = "orange" if hand == "upper" else "blue"
+            # 不写 note["color"]：该字段全项目无人消费（渲染器按 hand 上色），
+            # 而且 note_mapper 没有 import COLOR，写了会直接 NameError。
             cell["notes"].append(note)
 
         def _from_m(m: dict) -> dict:
@@ -162,20 +163,47 @@ def build_score(
                     "kind": "stroke", "approx": False,
                     "dur": ev_dur, "dur_sec": ev_dur_sec}
 
-        if ordered:
-            top = ordered[-1]
-            if top["approx"]:
-                approx_count += 1
-            _lane("upper", _from_m(top))
-            if len(ordered) > 1:
-                bot = ordered[0]
-                if bot["approx"]:
+        # ── 泳道分配 ───────────────────────────────────────────────
+        # 带圈数字 R/L 行谱：每个音自带 lane（upper/L/bass），直接落轨，
+        # 不再按音高排上/下两档 —— R/L/底行各自成轨，与输入三行版式一致。
+        # 其它通道（det/grid/视频/MIDI）事件没有 lane，走原有两档模型。
+        group_lanes = [m["lane"] for m in mapped if m.get("lane")]
+        if group_lanes:
+            for m in mapped:
+                hand = m.get("lane")
+                hand = hand if hand in ("upper", "lower", "bass") else "lower"
+                _lane(hand, _from_m(m))
+            if tap_count:
+                tl = tap_lane if tap_lane in ("upper", "lower", "bass") else "lower"
+                _lane(tl, dict(tap_note))
+        else:
+            uniq: dict[int, dict] = {}
+            for m in mapped:
+                uniq.setdefault(m["pos"], m)
+            ordered = sorted(uniq.values(), key=lambda m: m["midi"])
+
+            if len(ordered) > MAX_SIMULTANEOUS:
+                over_limit += 1
+
+            # 两档模型（用户规则）：上档橙、下档蓝，不再有中档；S 也可上可下
+            #   1 个音      → 上档
+            #   2 个音      → 高音上档、低音下档
+            #   1 个音 + S  → 音在上档、S 在下档
+            #   只有 S      → S 上档
+            if ordered:
+                top = ordered[-1]
+                if top["approx"]:
                     approx_count += 1
-                _lane("lower", _from_m(bot))
+                _lane("upper", _from_m(top))
+                if len(ordered) > 1:
+                    bot = ordered[0]
+                    if bot["approx"]:
+                        approx_count += 1
+                    _lane("lower", _from_m(bot))
+                elif tap_count:
+                    _lane("lower", dict(tap_note))
             elif tap_count:
-                _lane("lower", dict(tap_note))
-        elif tap_count:
-            _lane("upper", dict(tap_note))
+                _lane("upper", dict(tap_note))
 
         if tap_count:
             tap_total += 1

@@ -184,6 +184,137 @@ def _ocr_digit(binimg: np.ndarray, x0: int, y0: int, x1: int, y1: int,
     return _ocr_char(padded), holes
 
 
+def _merge_split_groups(groups: list[list]) -> list[list]:
+    """合并被切开的数字（一个数字的墨被拆成两块 → 被误当成两列）。
+
+    判据：相邻两组的间距 < 0.55 × 中位间距。谱册列距是节拍网格
+    （实测 ≈56px），而同一个数字被切开的两块间距只有十几 px。
+    不过这一关，列数会虚高（实测 34），整个槽位网格随之错位。
+    """
+    if len(groups) < 2:
+        return groups
+    groups = [list(g) for g in groups]
+    while len(groups) > 1:
+        centers = [g[0][0] for g in groups]
+        gaps = [centers[k + 1] - centers[k] for k in range(len(centers) - 1)]
+        thr = 0.55 * float(np.median(gaps))
+        hit = next((k for k, gp in enumerate(gaps) if gp < thr), None)
+        if hit is None:
+            break
+        groups = groups[:hit] + [groups[hit] + groups[hit + 1]] + groups[hit + 2:]
+    return groups
+
+
+def _dp_assign_slots(xs: list[float], model: list[float], n_slots: int,
+                     skip_cost: float = 45.0) -> list[tuple[int, int]]:
+    """单调 DP：把观测到的列心分配到槽位 0..n_slots-1。
+
+    槽位序号必须严格递增（列是从左到右排的）；某个观测可以被跳过
+    （代价 skip_cost），用来容忍多出来的碎块。
+    """
+    n = len(xs)
+    a, p, q, r = model
+
+    def pred(i: int) -> float:
+        return a + p * i + q * (i // 4) + r * (i // 16)
+
+    INF = float("inf")
+    # cost[g][s] = 处理完前 g 个观测、槽位 < s 已被占用时的最小代价
+    cost = [[INF] * (n_slots + 1) for _ in range(n + 1)]
+    prev = [[None] * (n_slots + 1) for _ in range(n + 1)]
+    cost[0][0] = 0.0
+    for g in range(n):
+        for sl in range(n_slots + 1):
+            c = cost[g][sl]
+            if c == INF:
+                continue
+            if c + skip_cost < cost[g + 1][sl]:          # 跳过当前观测
+                cost[g + 1][sl] = c + skip_cost
+                prev[g + 1][sl] = (g, sl, -1)
+            if sl < n_slots:                              # 当前观测落到槽位 sl
+                c2 = c + abs(xs[g] - pred(sl))
+                if c2 < cost[g + 1][sl + 1]:
+                    cost[g + 1][sl + 1] = c2
+                    prev[g + 1][sl + 1] = (g, sl, sl)
+    s = min(range(n_slots + 1), key=lambda k: cost[n][k])
+    if cost[n][s] == INF:
+        return []
+    assign: list[tuple[int, int]] = []
+    g = n
+    while g > 0:
+        step = prev[g][s]
+        if step is None:
+            break
+        pg, ps, assigned = step
+        if assigned >= 0:
+            assign.append((pg, assigned))
+        g = pg
+        s = ps
+    assign.reverse()
+    return assign
+
+
+def _fit_beat_grid(xs: list[float], n_slots: int = 32, iters: int = 8):
+    """节拍感知网格拟合：把观测列心单调分配到 0..n_slots-1。
+
+    模型  x(i) = a + p·i + q·(i//4) + r·(i//16)
+      p    → 六十四分音符的基本列距
+      i//4 → 每 4 格的节拍边界留白
+      i//16 → 每小节线的留白
+    先用 DP 分配，再最小二乘回代参数，迭代收敛。
+    """
+    n = len(xs)
+    if n == 0:
+        return None, []
+    if n == 1:
+        return [float(xs[0]), 0.0, 0.0, 0.0], [(0, 0)]
+    model = [float(xs[0]), float(np.median(np.diff(xs))), 0.0, 0.0]
+    assign = [(i, i) for i in range(n)]
+    for _ in range(iters):
+        assign = _dp_assign_slots(xs, model, n_slots)
+        if len(assign) < 3:
+            break
+        s_idx = np.array([sl for _, sl in assign], dtype=float)
+        y = np.array([xs[g] for g, _ in assign], dtype=float)
+        A = np.stack([np.ones_like(s_idx), s_idx,
+                      np.floor(s_idx / 4.0), np.floor(s_idx / 16.0)], axis=1)
+        try:
+            sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+        except Exception:  # noqa: BLE001
+            break
+        model = [float(v) for v in sol]
+    return model, assign
+
+
+def _slot_anchors(xs: list[float], n_slots: int = 32) -> list[float]:
+    """由底行观测到的列心，构建 n_slots 个槽位的 x 锚点。
+
+    ★ 底行的 32 个数字就是 32 个槽位的天然网格 —— 每个槽位一个数字，
+    它的**真实 x 位置**直接就是该槽位的锚点。比「均匀 linspace 网格」
+    准得多（实测 R/L 落格残差 5.7px vs 10.7px），因为排版在节拍边界和
+    小节线处留白，列距本来就不均匀。
+
+    若观测列数 ≠ 32（个别槽空缺 / 粘连），退到节拍感知模型补齐。
+    """
+    xs = sorted(float(v) for v in xs)
+    if not xs:
+        return []
+    if len(xs) == n_slots:
+        return xs
+    model, assign = _fit_beat_grid(xs, n_slots)
+    if model is None:
+        return [float(v) for v in np.linspace(xs[0], xs[-1], n_slots)]
+    a, p, q, r = model
+    anchors: list[float | None] = [None] * n_slots
+    for g, sl in assign:
+        if 0 <= sl < n_slots:
+            anchors[sl] = xs[g]
+    for i in range(n_slots):
+        if anchors[i] is None:
+            anchors[i] = a + p * i + q * (i // 4) + r * (i // 16)
+    return [float(v) for v in anchors]
+
+
 def _fix_digit(ch: str, holes: int, crop_h: int) -> str:
     """用孔洞数纠正 5↔6 形近混淆（带圈数字 / 底行数字通用）。
 
@@ -261,7 +392,6 @@ def _parse_impl(raw: bytes, debug: bool = False) -> list[list[dict]] | None:
         n_fail += nf
         if toks:
             rows_tokens.append(toks)
-
     with _INFO_LOCK:
         _LAST_INFO.clear()
         _LAST_INFO.update({
@@ -312,17 +442,21 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             groups[-1].append(c)
         else:
             groups.append([c])
-    # 每组取最高的分量当主数字（上标/装饰点更矮）
+    # ★ 把被切开的数字合并回一列（否则列数虚高，槽位网格整体错位）
+    groups = _merge_split_groups(groups)
     if not (28 <= len(groups) <= 36):
         return None                       # 不是这个版式的槽位密度
 
-    xs = [g[0][0] for g in groups]
-    x_first, x_last = xs[0], xs[-1]
-    ideal = np.linspace(x_first, x_last, 32)
+    # ★ 槽位锚点用底行数字的**真实列心**，不是均匀 linspace：
+    #   排版在节拍边界 / 小节线处留白，列距本来就不均匀。
+    anchors = _slot_anchors([g[0][0] for g in groups], 32)
+    if len(anchors) < 32:
+        return None
+    anchor_arr = np.array(anchors, dtype=float)
 
     def slot_of(cx: float) -> int:
         """统一就近落格：R/L 与底行共用同一套 32 槽位网格（argmin）。"""
-        return int(np.clip(np.argmin(np.abs(ideal - cx)), 0, 31))
+        return int(np.clip(np.argmin(np.abs(anchor_arr - cx)), 0, 31))
 
     by_slot: dict[int, list] = {}
     for g in groups:
@@ -350,7 +484,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
     n_bass = 0
     for si, (_, ch) in enumerate(bass):
         if ch and ch != "0" and ch in "0123456789":
-            tok = {"slot": si, "ch": ch, "beams": 0, "voice": "lower"}
+            tok = {"slot": si, "ch": ch, "beams": 0, "voice": "lower", "lane": "bass"}
             if debug:
                 tok["_src"] = "bass"
                 tok["_holes"] = bass_holes.get(si, 0)
@@ -401,7 +535,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
         if key in seen:
             continue                        # 同槽同声部去重
         seen.add(key)
-        tok = {"slot": slot, "ch": ch, "beams": 0, "voice": voice}
+        tok = {"slot": slot, "ch": ch, "beams": 0, "voice": voice, "lane": voice}
         if debug:
             tok["_src"] = "R" if voice == "upper" else "L"
             tok["_holes"] = int(holes)
@@ -432,7 +566,7 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             if key in seen:
                 continue
             seen.add(key)
-            tok = {"slot": slot, "ch": ch, "beams": 0, "voice": voice}
+            tok = {"slot": slot, "ch": ch, "beams": 0, "voice": voice, "lane": voice}
             if debug:
                 tok["_src"] = "R" if voice == "upper" else "L"
             tokens.append(tok)

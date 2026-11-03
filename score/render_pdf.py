@@ -142,21 +142,31 @@ def _draw_system(ax, mid_top: float, bars: list[dict], first_bar_no: int, cells:
                 continue
             x = x0 + b * bar_w + (slot + 0.5) * cell_w
             for n in ev.get("notes") or []:
-                # 两档模型：上档橙、下档蓝（颜色跟档位走）；老数据 hand=mid 视为上档
+                # 三泳道：上档橙(R) / 下档蓝(L) / 底行绿(低音)。
+                # 老数据 hand=mid 视为上档；带圈数字行谱按 lane 落轨，与输入三行一致。
                 hand = n.get("hand") or "upper"
                 if hand == "mid":
                     hand = "upper"
-                is_upper = hand != "lower"
                 label = n.get("label") or (str(n["pos"]) if n.get("pos") else "S")
-                color = COLOR["orange"] if is_upper else COLOR["blue"]
 
-                if is_upper:
+                if hand == "bass":
+                    color = COLOR["bass"]
+                    # 第三泳道：底行低音。往下多沉 bass_drop_mm，
+                    # 否则 L 行字块底边会压到底行字块顶边（实测压 1.3mm）。
+                    yl = mid_c - NOTE["gap_mm"] * 2 - NOTE["bass_drop_mm"]
+                    ax.text(x, yl, label,
+                            fontsize=NOTE["bass_size"], ha="center", va="top",
+                            color=color, fontfamily=NUM)
+                    yline = yl + 1.2
+                elif hand != "lower":                          # upper
+                    color = COLOR["orange"]
                     yl = mid_c + NOTE["gap_mm"]
                     ax.text(x, yl, label,
                             fontsize=NOTE["upper_size"], ha="center", va="bottom",
                             color=color, fontfamily=NUM)
                     yline = yl - 1.2
-                else:
+                else:                                          # lower
+                    color = COLOR["blue"]
                     yl = mid_c - NOTE["gap_mm"]
                     ax.text(x, yl, label,
                             fontsize=NOTE["lower_size"], ha="center", va="top",

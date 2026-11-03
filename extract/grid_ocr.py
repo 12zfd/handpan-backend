@@ -73,6 +73,51 @@ _ENGINE_CHECKED = False
 _EASY_READER = None
 
 
+def _find_tesseract() -> str | None:
+    """定位 tesseract 可执行文件。
+
+    pytesseract 默认直接调 "tesseract"，依赖**子进程 PATH**。
+    Windows 上 tesseract 往往只是装了、没进 PATH（甚至只装了 GUI 版），
+    于是 pytesseract 抛 FileNotFoundError → _pick_engine 判定「无引擎」
+    → 全部字符识别为空 → 整页解析退化成 None（空白谱）。
+    这里主动找一遍：先找 PATH，再找 Windows 常见安装目录，最后回落到
+    pytesseract 自带的 tesseract_cmd。
+    """
+    import shutil
+    import glob
+
+    exe = shutil.which("tesseract")
+    if exe:
+        return exe
+
+    # Windows 常见安装目录（UB-Mannheim / 官方 installer 默认路径）
+    if os.name == "nt":
+        patterns = [
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         "Tesseract-OCR", "tesseract.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                         "Tesseract-OCR", "tesseract.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                         "Tesseract-OCR", "tesseract.exe"),
+        ]
+        for p in patterns:
+            if p and os.path.exists(p):
+                return p
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),):
+            hits = glob.glob(os.path.join(base, "Tesseract*", "tesseract.exe"))
+            if hits:
+                return hits[0]
+
+    try:
+        import pytesseract
+        cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "")
+        if cmd and os.path.exists(cmd):
+            return cmd
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _pick_engine() -> str | None:
     """pytesseract（需要系统 tesseract-ocr）→ easyocr（纯 Python 但重）→ None。
 
@@ -87,6 +132,9 @@ def _pick_engine() -> str | None:
     try:
         import pytesseract  # noqa: F401
         from pytesseract import TesseractNotFoundError
+        tesseract_exe = _find_tesseract()
+        if tesseract_exe:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_exe
         try:
             pytesseract.image_to_string(
                 Image.new("L", (32, 32), 255), config="--psm 10")

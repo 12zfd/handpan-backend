@@ -75,6 +75,10 @@ SCORE_CHARS = re.compile(r"^[0-9DXxTtSsDd|Il]{1,}$")
 
 # 网格兜底通道（extract/grid_ocr.py）最近一次的元信息；None = 未启用。
 _LAST_RESCUE: dict | None = None
+# 本次解析「每行占多少格」。R/L 行谱版式每行恰好 2 小节 = 32 格；
+# det/grid 通道的行尾可能溢出，需要 ROW_SLOTS(=40) 的余量。
+# 两者混用会让后续行的行首逐行漂移（每行差 8 格），音节就对不上。
+_LAST_ROW_SLOTS: int = ROW_SLOTS
 # 小节号：纯数字，1~2 位（原谱行首编号 24、26、28…；末行会有 5 这种 1 位）。
 # ⚠️ 千万不能用 ^\d{2,}$ —— 谱面里的音符组大量是纯数字
 #    （9876 / 7876 / 5654 / 3456 …），会被整组当成小节号丢掉，
@@ -884,6 +888,8 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
       2. 在**原图**上独立检测所有横线段（符杠）——原图分辨率，细线不被抹掉
       3. 逐行分组 + 按 x 落格（不再顺序拼接）
     """
+    global _LAST_ROW_SLOTS
+    _LAST_ROW_SLOTS = ROW_SLOTS
     t0 = time.time()
     # 统一预处理：超大图先等比缩到 OCR_MAX_WIDTH。
     # OCR 与符杠检测必须用**同一张图**，否则两套坐标系对不上，
@@ -923,11 +929,30 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
         if g_valid >= 2 and g_valid > d_valid:
             rows_tokens = grid_rows
 
-    # ── 第三通道（兜底）：主通道一个有效行都没有时，
-    #    用纯 OpenCV 网格切分 + 单元格 OCR 再救一次。
-    #    场景：Render 上 OCR 引擎崩/内存不足/彩色底干扰 —— 只要图上有
-    #    网格线就能把音挖出来。识别不到网格或一个字都没认出则返回 None，
-    #    由上层（pipeline）落空白谱兜底。
+    # ── 第三通道（兜底）：主通道一个有效行都没有时，先试 R/L 行谱
+    #    专用解析（带圈数字版式，几何定位 + 槽位网格，精度最高），
+    #    不匹配再退到纯 OpenCV 网格切分 + 单元格 OCR。
+    #    识别不到则返回 None，由上层（pipeline）落空白谱兜底。
+    global _LAST_RESCUE
+    if not any(rows_tokens):
+        try:
+            from .rl_score import last_info as rl_last_info, parse_rl_score
+            rl = parse_rl_score(proc_raw)
+            if rl:
+                rows_tokens = rl
+                # R/L 行谱每行恰好 2 小节 = 32 格，不能用 40 格的余量行宽：
+                # 那样第 2 行会从第 40 格开始（而不是 32），逐行累积 8 格偏移。
+                _LAST_ROW_SLOTS = SLOTS_PER_BAR * BARS_PER_ROW
+                info = rl_last_info()
+                _LAST_RESCUE = {
+                    "engine": "R/L版式解析",
+                    "rows": info.get("rows"),
+                    "cols": info.get("cols"),
+                    "chars": info.get("chars"),
+                    "mode": "rl",
+                }
+        except Exception:  # noqa: BLE001 —— 兜底通道失败不致命
+            pass
     if not any(rows_tokens):
         try:
             from .grid_ocr import last_info, recognize_grid
@@ -935,7 +960,6 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
             if rescue:
                 rows_tokens = rescue
                 info = last_info()
-                global _LAST_RESCUE
                 _LAST_RESCUE = {
                     "engine": info.get("engine"),
                     "rows": info.get("rows"),
@@ -1005,8 +1029,9 @@ def image_to_tab(raw: bytes | list[bytes],
             empty_pages += 1
             continue
         # 每张图从整行（2 小节）开始，避免跨图串拍
-        if cursor % ROW_SLOTS:
-            cursor += ROW_SLOTS - cursor % ROW_SLOTS
+        row_slots = _LAST_ROW_SLOTS
+        if cursor % row_slots:
+            cursor += row_slots - cursor % row_slots
 
         # ★ 行对齐落格：每行固定占 ROW_SLOTS 格，行内字符按 x 落到 slot。
         #   一行无论读出多少字符，下一行永远从正确的行首开始 ——
@@ -1029,17 +1054,20 @@ def image_to_tab(raw: bytes | list[bytes],
                 if ch in "XxTtSs":
                     unpitched += 1
                     events.append({"start": start, "pitch": None, "kind": "stroke",
-                                   "label": "S", "beams": beams, "dur": dur, "amp": 0.8})
+                                   "label": "S", "beams": beams, "dur": dur, "amp": 0.8,
+                                   "lane": tok.get("lane")})
                     continue
                 if ch in "Dd":
                     events.append({"start": start, "pitch": 50, "kind": "ding",
-                                   "label": "D", "beams": beams, "dur": dur, "amp": 0.9})
+                                   "label": "D", "beams": beams, "dur": dur, "amp": 0.9,
+                                   "lane": tok.get("lane")})
                     continue
                 midi = midi_of.get(int(ch)) if ch.isdigit() else None
                 if midi is not None:
                     events.append({"start": start, "pitch": midi,
-                                   "beams": beams, "dur": dur, "amp": 0.9})
-            cursor = row_base + ROW_SLOTS
+                                   "beams": beams, "dur": dur, "amp": 0.9,
+                                   "lane": tok.get("lane")})
+            cursor = row_base + row_slots
 
     if not events:
         out = {
@@ -1062,12 +1090,20 @@ def image_to_tab(raw: bytes | list[bytes],
         f"排布结果 {cursor} 格 ≈ {bars} 小节（应与原谱一致；有偏差说明横线检测有误，请对照原图校对）",
     ]
     if _LAST_RESCUE:
-        warnings.append(
-            "整页 OCR 没读出有效行，已用 OpenCV 网格切分兜底识别"
-            f"（引擎={_LAST_RESCUE.get('engine') or '无'}，"
-            f"{_LAST_RESCUE.get('rows', 0)} 行 × {_LAST_RESCUE.get('cols', 0)} 格，"
-            f"认出 {_LAST_RESCUE.get('chars', 0)} 字）。兜底通道只认单元格内主字，"
-            "横线时值一律按 1 格算，请对照原图校对。")
+        if _LAST_RESCUE.get("mode") == "rl":
+            warnings.append(
+                "识别出 R/L 行谱版式，已按带圈数字逐音解析"
+                f"（{_LAST_RESCUE.get('rows', 0)} 个系统行，"
+                f"底行音 {_LAST_RESCUE.get('chars', 0)} 个）。"
+                "带圈数字按谱面 x 位置精确落格，底行 0 视为休止；"
+                "上标指法标记与装饰点已忽略，请对照原图校对。")
+        else:
+            warnings.append(
+                "整页 OCR 没读出有效行，已用 OpenCV 网格切分兜底识别"
+                f"（引擎={_LAST_RESCUE.get('engine') or '无'}，"
+                f"{_LAST_RESCUE.get('rows', 0)} 行 × {_LAST_RESCUE.get('cols', 0)} 格，"
+                f"认出 {_LAST_RESCUE.get('chars', 0)} 字）。兜底通道只认单元格内主字，"
+                "横线时值一律按 1 格算，请对照原图校对。")
     if _LAST_TWO_COLUMN:
         warnings.append(
             "这张图是双栏排版（左右两栏谱面并排）。双栏图的字符顺序在 OCR "
