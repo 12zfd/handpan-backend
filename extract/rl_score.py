@@ -452,8 +452,12 @@ def _parse_impl(raw: bytes, debug: bool = False,
 
     if w != RL_REF_WIDTH:
         k = RL_REF_WIDTH / float(w)
+        # 缩小用 INTER_AREA（抗锯齿，保住「0」的内孔）；
+        # 放大必须用 INTER_CUBIC/LANCZOS —— INTER_AREA 在放大时等价于最近邻，
+        # 会把字形锯齿化、孔洞边缘破碎。
+        interp = cv2.INTER_AREA if k < 1.0 else cv2.INTER_CUBIC
         gray = cv2.resize(gray, (RL_REF_WIDTH, max(1, int(round(h * k)))),
-                          interpolation=cv2.INTER_AREA)
+                          interpolation=interp)
         colored = cv2.resize(colored.astype(np.uint8),
                              (gray.shape[1], gray.shape[0]),
                              interpolation=cv2.INTER_NEAREST).astype(bool)
