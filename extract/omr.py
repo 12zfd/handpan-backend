@@ -937,7 +937,11 @@ def _page_tokens(raw: bytes, timing: "_Timing | None" = None) -> tuple[list[list
     if not any(rows_tokens):
         try:
             from .rl_score import last_info as rl_last_info, parse_rl_score
-            rl = parse_rl_score(proc_raw)
+            # ★ 传入**原图** raw：R/L 解析器的全部几何阈值都是按 2160 宽原图
+            #   调出来的。1080 归一化图在几何层面就已损坏（底行数字粘连 → 每行
+            #   漏 1~3 格、「0」内孔被压漏 → 孔洞特征失效、圈内数字缩到 25px
+            #   → OCR 认不出），必须整体用原图解析。
+            rl = parse_rl_score(proc_raw, hi_raw=raw)
             if rl:
                 rows_tokens = rl
                 # R/L 行谱每行恰好 2 小节 = 32 格，不能用 40 格的余量行宽：

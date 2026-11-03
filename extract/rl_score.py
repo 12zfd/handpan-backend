@@ -27,10 +27,20 @@
 from __future__ import annotations
 
 import io
+import os
 import threading
 
 import numpy as np
 from PIL import Image
+
+# ★ 本解析器的**设计工作分辨率**（原图书页谱宽度）。
+#   全部几何阈值（圈径 24~90px、洞高占比、底行分组间距…）都是按这个宽度调出来的。
+#   若上游把图缩到 1080 再交给本解析器，几何层面就会崩：
+#     · 底行数字粘连 → 连通域分组每行漏 1~3 格（实测 32/29/31/30/30/29）
+#     · 「0」的内孔被压漏 → 孔洞特征彻底失效（TP=0/FN=24）
+#     · 圈内带圈数字缩到 25px → OCR 大批认不出
+#   所以 R/L 通道必须拿到原图；这里只作为兜底的目标缩放宽度。
+RL_REF_WIDTH = int(os.environ.get("RL_REF_WIDTH", "2160"))
 
 _INFO_LOCK = threading.Lock()
 _LAST_INFO: dict = {}
@@ -388,26 +398,67 @@ def _fix_digit(ch: str, holes: int, crop_h: int) -> str:
 
 # ── 主解析 ───────────────────────────────────────────────────────
 
-def parse_rl_score(raw: bytes, debug: bool = False) -> list[list[dict]] | None:
+def parse_rl_score(raw: bytes, debug: bool = False,
+                   hi_raw: bytes | None = None) -> list[list[dict]] | None:
     """单页 R/L 行谱 → rows_tokens；不是这种版式或解析失败返回 None。
 
     debug=True 时每个 token 带 "_src"（"bass"/"R"/"L"），仅供诊断脚本区分
     底行 / 右手行 / 左手行，不影响生产消费。
+
+    hi_raw：可选的**原图**（未归一化到 1080 的高分辨率图）。
+    传入后**整个解析过程**（几何 + 槽位网格 + OCR）都在原图上做。
+    原因：1080 缩图在几何层面就已损坏 —— 底行数字粘连导致每行漏 1~3 格
+    （实测 32/29/31/30/30/29 vs 原图 32/32/32/32/32/32）、「0」的内孔被压漏
+    使孔洞特征彻底失效、圈内带圈数字缩到 25px 后 OCR 大批认不出。
+    原图 2160 宽下「0」洞高占比 0.70~0.77，与 4/6/8 零重叠，可稳定区分；
+    tesseract 版本差异（本地 5.4 / 线上 5.3）也不再影响结果。
     """
     try:
-        return _parse_impl(raw, debug=debug)
+        return _parse_impl(raw, debug=debug, hi_raw=hi_raw)
     except Exception:  # noqa: BLE001
         return None
 
 
-def _parse_impl(raw: bytes, debug: bool = False) -> list[list[dict]] | None:
+def _parse_impl(raw: bytes, debug: bool = False,
+                hi_raw: bytes | None = None) -> list[list[dict]] | None:
     import cv2
     from .grid_ocr import _to_gray
 
-    gray, colored = _to_gray(raw)
+    # ── 工作图：优先用原图（hi_raw），否则用传进来的 raw ──
+    #
+    # ★ 为什么必须用原图（这是本解析器的正确工作分辨率）：
+    #   本解析器的全部几何阈值都是按 **2160 宽**的原图书页谱调出来的
+    #   （见 _find_rings「圈径范围 2160px 图 → 24~90」）。
+    #   omr 把所有输入统一归一化到 1080 宽后交给本解析器，等于把它降级：
+    #     · 底行数字在缩放中粘连 → 连通域分组每行漏 1~3 格（实测 32/29/31/30/30/29），
+    #       整页少认约 14 个真音；
+    #     · 「0」的内孔在缩放中被压漏（笔画断开 → 孔洞与背景连通），
+    #       孔洞特征彻底失效，tesseract 对这种残缺字形极不稳定：
+    #       本地 5.4 勉强猜对，线上 Debian 5.3 直接把休止位读成 4 → 休止变音符；
+    #     · 圈内带圈数字被缩到 25px，OCR 大量认不出 → 右手/左手行音符整批丢失。
+    #   原图 2160 宽下：底行 6 个系统全是 32 组、「0」洞高占比 0.70~0.77
+    #   （与 4/6/8 零重叠）、真圈 85 个 —— 全部稳定。
+    #
+    # 工作图统一缩放到 RL_REF_WIDTH（默认 2160 = 本解析器的设计分辨率），
+    # 这样不论输入多大，几何阈值都落在同一尺度上。
+    src = hi_raw if hi_raw else raw
+    try:
+        gray, colored = _to_gray(src)
+    except Exception:  # noqa: BLE001
+        return None
     h, w = gray.shape[:2]
     if w < 500 or h < 400:
         return None
+
+    if w != RL_REF_WIDTH:
+        k = RL_REF_WIDTH / float(w)
+        gray = cv2.resize(gray, (RL_REF_WIDTH, max(1, int(round(h * k)))),
+                          interpolation=cv2.INTER_AREA)
+        colored = cv2.resize(colored.astype(np.uint8),
+                             (gray.shape[1], gray.shape[0]),
+                             interpolation=cv2.INTER_NEAREST).astype(bool)
+        h, w = gray.shape[:2]
+
     binimg = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
     binimg[colored] = 0
