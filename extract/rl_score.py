@@ -163,8 +163,18 @@ def _count_holes(crop: np.ndarray) -> int:
 
 
 def _ocr_digit(binimg: np.ndarray, x0: int, y0: int, x1: int, y1: int,
-               target_h: int = 52):
-    """二值图裁块 → 单字符 OCR + 内部孔洞数（同 _ocr_crop，但多返回 holes）。"""
+               target_h: int = 52, zero_guard: bool = False):
+    """二值图裁块 → 单字符 OCR + 内部孔洞数（同 _ocr_crop，但多返回 holes）。
+
+    zero_guard=True 时启用**与 OCR 引擎版本无关的几何兜底**：
+    若 tesseract 读出的不是 '0'，但字符块的孔洞拓扑明确是 '0'
+    （1 洞 + 很高 + 居中），就地纠正。
+    这是为了根治「线上 tesseract 5.3 把底行 0 读成 4」→ 休止变音符的问题。
+
+    ⚠ 只在**底行**（普通数字，0=休止）启用。
+    带圈数字路径绝不能开：那里 '0' 不是休止，而是「圈里没数字」→
+    被误判成 0 会直接把音符丢掉。
+    """
     from .grid_ocr import _ocr_char
     crop = binimg[max(0, y0):y1, max(0, x0):x1]
     ys, xs = np.nonzero(crop)
@@ -181,7 +191,12 @@ def _ocr_digit(binimg: np.ndarray, x0: int, y0: int, x1: int, y1: int,
     img = img.point(lambda v: 255 if v > 200 else 0)
     padded = Image.new("L", (img.width + 16, img.height + 16), 255)
     padded.paste(img, (8, 8))
-    return _ocr_char(padded), holes
+    ch = _ocr_char(padded)
+    # ★ 几何兜底：tesseract 说是 4/6/8 等，但几何上是 0 → 强制纠正为 0。
+    #   只在「非 0 且几何强判为 0」时改，绝不反向（避免把真 4/6 改坏）。
+    if zero_guard and ch and ch != "0" and _zero_geometry(tight):
+        ch = "0"
+    return ch, holes
 
 
 def _merge_split_groups(groups: list[list]) -> list[list]:
@@ -313,6 +328,48 @@ def _slot_anchors(xs: list[float], n_slots: int = 32) -> list[float]:
         if anchors[i] is None:
             anchors[i] = a + p * i + q * (i // 4) + r * (i // 16)
     return [float(v) for v in anchors]
+
+
+def _zero_geometry(tight: np.ndarray) -> bool:
+    """几何判据：这个数字是不是 '0'（休止位）？
+
+    背景：线上（Debian tesseract 5.3）与本地（5.4.0）对同一张图读数不同，
+    表现为底行的 '0' 被读成 '4' → **休止位凭空变成音符**。
+    tesseract 的版本差异不可控，所以给 '0' 加一条与 OCR 引擎无关的
+    几何判据，跨版本稳定。
+
+    '0' 的拓扑特征（实测本图 206 个底行数字，零重叠）：
+      · 恰好 1 个内部孔洞；
+      · 孔洞**纵向居中**（中心在字高 0.48~0.52）；
+      · 孔洞**很高**（占字高 0.70~0.77）。
+    对照：'4' 洞高占比 0.39~0.42、中心 0.40；'6' 洞高占比 0.37~0.41、中心 0.67。
+    阈值取洞高占比 ≥ 0.60，与 4/6 之间留足余量。
+    """
+    if tight.size == 0:
+        return False
+    import cv2
+    bg = 1 - (tight > 0).astype(np.uint8)
+    n, _lab, st, _ = cv2.connectedComponentsWithStats(bg, connectivity=8)
+    hh = tight.shape[0]
+    if hh < 10:
+        return False
+    best = None
+    for k in range(1, n):
+        x, y, ww, h_hole, area = st[k]
+        # 只认内部孔（不贴边）
+        if x <= 0 or y <= 0 or x + ww >= bg.shape[1] or y + h_hole >= bg.shape[0]:
+            continue
+        if area < 4:
+            continue
+        if best is None or h_hole > best[1]:
+            best = (y, h_hole)
+    if best is None:
+        return False
+    y, h_hole = best
+    ratio_h = h_hole / float(hh)
+    center = (y + h_hole / 2.0) / float(hh)
+    # 恰好一个大孔 + 很高 + 居中 ⇒ 是 0
+    return ratio_h >= 0.60 and 0.40 <= center <= 0.60
 
 
 def _fix_digit(ch: str, holes: int, crop_h: int) -> str:
@@ -475,7 +532,8 @@ def _parse_system(binimg, h_lines, rings, yb, ys_, yu, w, debug: bool = False):
             miss += 1
             continue
         _, _, x, y, ww, hh = main
-        ch, holes = _ocr_digit(binimg, x, by0 + y, x + ww, by0 + y + hh, target_h=52)
+        ch, holes = _ocr_digit(binimg, x, by0 + y, x + ww, by0 + y + hh, target_h=52,
+                               zero_guard=True)
         ch = _fix_digit(ch, holes, hh)
         bass.append((si, ch))
         bass_holes[si] = holes
