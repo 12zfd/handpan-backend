@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import NullPool, QueuePool
 
 from models import Base
 
@@ -63,32 +63,54 @@ DATABASE_URL = _normalize(
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    # ★★ Neon 的 CU-hours 与出网流量，全都取决于「连接被怎么持有」★★
+    # ── PostgreSQL 连接策略（生产库 Aiven Free：1 CPU / 1 GB RAM / max_connections=20）──
     #
-    # 坑 1（CU-hours）：SQLAlchemy 的 pool_recycle 只在「取连接时」判定过期，
-    #   池里那条启动时开的空闲连接永远不会被回收 —— 它被永久持有；
-    #   Neon 只要看到还有连接在，就不会把 compute 缩到零，compute 24 小时在跑，
-    #   100 CU-hours 的免费额度 4 天就烧光，之后整个月都是 "exceeded the quota"。
-    #   → 改用 NullPool：连接用完即关，绝不留空闲连接。
-    #   （Session 在一个事务内始终复用同一条连接，所以每请求只开 1 次连接，
-    #     get_db 里那次探活 select(1) 不额外开连接。）
+    # 历史背景：这套代码最早跑在 Neon 免费版，Neon 按「compute 能否缩到 0」计
+    # CU-hours —— 池里留一条空闲连接就会让 compute 24h 常驻、4 天烧光额度，
+    # 所以当时刻意改成 NullPool（连接用完即关）。
     #
-    # 坑 2（出网流量）：出网字节按「Neon → 应用」计，取出来又丢掉的字段照样计费。
-    #   → 见 main.py 里 /history、/tasks/{id} 的 load_only()。
-    _kwargs: dict = dict(poolclass=NullPool)
-    # Render 免费容器没有 IPv6 出网，而 Neon 域名是双栈解析；
-    # 显式解析一个 IPv4 交给 psycopg（host 仍用于 TLS 证书校验），避免 it 只试 IPv6 而失败。
+    # 现在生产库是 **Aiven Free**（固定规格，不按连接存活计费），改为可配置：
+    #   · 默认 QueuePool(pool_size=5, max_overflow=2)：复用连接，省掉每次 TLS 握手；
+    #   · DB_POOL_MODE=nullpool：一键回退「用完即关」。Aiven Free 的
+    #     max_connections 只有 20 且 Aiven 自身运维还要占用若干条，一旦改成多
+    #     worker / 多副本，池连接会成倍放大；遇到连接数或内存告警时，
+    #     **改一个环境变量即可恢复，不用改代码、不用重新发版**。
+    #     见 aiven.io/docs/products/postgresql/reference/pg-connection-limits
+    #
+    # 池化三件套（防「僵死连接」与「请求无限等连接」）：
+    #   pool_pre_ping=True —— 取连接前先探活，断线自动重连（Aiven/中间件会静默断空闲连接）
+    #   pool_recycle=280   —— 连接活过 280s 主动换掉，早于常见 300s 空闲断线
+    #   pool_timeout=10    —— 池空时最多等 10s，超时报错而不是把请求挂死
+    _mode = os.environ.get("DB_POOL_MODE", "queue").strip().lower()
+    if _mode == "nullpool":
+        _kwargs: dict = dict(poolclass=NullPool)
+    else:
+        _kwargs = dict(
+            poolclass=QueuePool,
+            pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+            max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "2")),
+            pool_pre_ping=True,
+            pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "280")),
+            pool_timeout=int(os.environ.get("DB_POOL_TIMEOUT", "10")),
+        )
+
+    # connect_timeout：库不可达时不能让启动钩子 / 请求无限挂住。
+    # application_name：在 Aiven 的 pg_stat_activity 里能一眼认出应用连接，
+    #   排查「连接泄漏 / idle in transaction」时是关键线索。
+    _ca = {
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+        "application_name": "handpan-backend",
+    }
+    # Render 免费容器没有 IPv6 出网，而 Aiven 域名是双栈解析；
+    # 显式解析一个 IPv4 交给 psycopg（host 仍用于 TLS 证书校验），避免只试 IPv6 而失败。
     try:
         _host = make_url(DATABASE_URL).host
         _infos = socket.getaddrinfo(_host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
         if _infos:
-            _ca = {"hostaddr": _infos[0][4][0]}
-            # connect_timeout 必须有：Neon 不可达时 psycopg 默认可能挂很久，
-            # 启动钩子会卡住，连 /healthz 都探不到。
-            _ca["connect_timeout"] = int(os.environ.get("DB_CONNECT_TIMEOUT", "8"))
-            _kwargs["connect_args"] = _ca
+            _ca["hostaddr"] = _infos[0][4][0]
     except OSError:
         pass  # 解析失败就按默认行为连接
+    _kwargs["connect_args"] = _ca
     engine = create_engine(DATABASE_URL, **_kwargs)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -155,6 +177,32 @@ def fallback_to_sqlite(reason: str = "") -> bool:
     return True
 
 
+def pool_stats() -> dict:
+    """连接池当前状态，供 /healthz 观察「连接是否泄漏」。
+
+    checkedout 长期接近 pool_size+max_overflow，就说明有请求没归还连接。
+    NullPool 没有这些方法，返回 mode 即可。
+    """
+    p = engine.pool
+    out = {"mode": type(p).__name__}
+    fn = getattr(p, "checkedout", None)
+    if callable(fn):
+        try:
+            out["checkedout"] = fn()          # 正在被请求占用的连接数
+        except Exception:  # noqa: BLE001
+            pass
+    ci = getattr(p, "checkedin", None)          # QueuePool 上是 property，不是方法
+    if isinstance(ci, (int, float)):
+        out["checkedin"] = ci                  # 池中空闲可复用的连接数
+    fn = getattr(p, "size", None)
+    if callable(fn):
+        try:
+            out["pool_size"] = fn()            # 配置的池大小（非当前实际连接数）
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def get_db():
     """取一个会话。Postgres 连不上时自动降级到 SQLite 并重试本次请求。
 
@@ -165,13 +213,32 @@ def get_db():
     if not _state["sqlite"]:
         try:
             db.execute(select(1))
+            # ★ 探活这条 SELECT 会自动 BEGIN 一个事务。若不结束，整个请求期间
+            #   连接都停在「idle in transaction」（Aiven 上要等
+            #   idle_in_transaction_session_timeout=300s 才被服务端清理）。
+            #   此刻还没加载任何 ORM 对象，rollback 无副作用，后续查询会自动重新 BEGIN。
+            db.rollback()
         except Exception as exc:  # noqa: BLE001
-            db.close()
             _state["last_error"] = str(exc)[:300]
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
             if not fallback_to_sqlite(str(exc)[:200]):
                 raise
             db = SessionLocal()
     try:
         yield db
+    except Exception:
+        # 路由抛异常时事务可能停在半途 → 显式回滚，保证连接归还池中是干净状态。
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     finally:
-        db.close()
+        # 每个请求必关。close 失败只记日志，不能掩盖路由原本的异常。
+        try:
+            db.close()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("handpan.db").warning("Session.close 失败: %s", exc)

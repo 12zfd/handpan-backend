@@ -39,10 +39,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
-from database import get_db, init_db
+from database import get_db, init_db, pool_stats
 from database import SQLITE_PATH, db_backend, db_last_error, fallback_to_sqlite, is_fallback
 from models import Score, User
 from pipeline import render_only, run_pipeline
@@ -96,12 +97,22 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 
     detail = "服务器内部错误"
     code = "internal_error"
-    text = str(exc).lower()
-    if "exceeded the quota" in text or "too many connections" in text:
-        detail = "数据库配额已用尽，已临时切换到本地数据库（历史记录暂不可见）"
+    # 数据库故障判定：异常类型优先，字符串兜底。
+    # 只靠 str(exc) 匹配会漏 —— DBAPIError 常被 FastAPI 包一层，
+    # 原文里未必出现 "operationalerror" 字样。
+    text = f"{type(exc).__name__} {exc}".lower()
+    is_db_exc = isinstance(exc, (OperationalError, InterfaceError, DBAPIError))
+    connection_full = any(k in text for k in (
+        "too many connections", "max_connections", "connection pool exhausted",
+        "exceeded the quota", "remaining connection slots"))
+    if connection_full:
+        detail = "数据库连接数已达上限（免费版上限 20 条），已临时切换到本地数据库，请稍后重试"
         code = "db_quota_exceeded"
-    elif "operationalerror" in text or "connection" in text:
-        detail = "数据库暂时不可用，已临时切换到本地数据库（历史记录暂不可见）"
+    elif is_db_exc or any(k in text for k in (
+            "operationalerror", "interfaceerror", "connection refused",
+            "connection timed out", "server closed the connection",
+            "could not connect", "ssl syscall error", "terminating connection")):
+        detail = "数据库暂时不可用，已临时切换到本地数据库（历史记录暂不可见），请稍后重试"
         code = "db_unavailable"
 
     # 数据库类故障 → 立刻降级到 SQLite，让后续请求能正常走通
@@ -747,7 +758,10 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
     之前 /healthz 完全不碰数据库，所以数据库挂掉时它仍返回 200，
     表现为「服务活着但所有功能全挂」，很难第一时间发现问题。
     """
-    out: dict = {"ok": True, "ts": int(time.time()), "db_backend": db_backend()}
+    # db_pool：连接池实时水位。checkedout 长期贴近 pool_size+max_overflow
+    # 就说明有请求没归还连接 —— 这是「连接泄漏」最直接的观测点。
+    out: dict = {"ok": True, "ts": int(time.time()), "db_backend": db_backend(),
+                 "db_pool": pool_stats()}
     _err = db_last_error()
     if _err:
         # 最近一次 Postgres 故障原文：配额超限 / 出网额度用尽 / 连不上 / 认证失败。
@@ -846,6 +860,8 @@ def build_info():
         "score/note_mapper.py": _fp("score/note_mapper.py"),
         "score/layout.py": _fp("score/layout.py"),
         "score/render_pdf.py": _fp("score/render_pdf.py"),
+        "database.py": _fp("database.py"),
+        "main.py": _fp("main.py"),
     }
     # 能力探针：源码里出现这些符号 = 新版能力已上线
     caps = {}
