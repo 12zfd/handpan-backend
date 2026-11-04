@@ -43,7 +43,7 @@ from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
-from database import dispose_engine, get_db, init_db, pool_stats
+from database import db_runtime_stats, dispose_engine, get_db, init_db, pool_stats
 from database import SQLITE_PATH, db_backend, db_last_error, fallback_to_sqlite, is_fallback
 from models import Score, User
 from pipeline import render_only, run_pipeline
@@ -802,7 +802,40 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
             out["ok"] = False
             out["db"] = "unavailable"
             out["error"] = str(exc)[:200]
+        # PG 侧运行时指标：连接数 / 内存。OOM 类问题的第一现场都在这里。
+        out["db_runtime"] = db_runtime_stats()
     return out
+
+
+@app.get("/healthz/watch")
+def healthz_watch():
+    """内存 / 连接看门狗 —— 给「只看 HTTP 码 + 关键词」的监控（UptimeRobot）用。
+
+    正常时 body 里带 `MEMORY_OK`；异常时返回 503 且**不含**该关键词，
+    于是「不要出现 MEMORY_OK」型监控就会在出问题时报警。
+
+    used_mb 是**估算**：shared_buffers + 本应用连接数 × 单连接私有内存。
+    它覆盖不到 OS page cache 与 PG 后台进程，所以阈值给得宽（默认 820MB
+    = 1GB 容器的 80%）；真正的兜底仍然是「连接数钉死 5 条」。
+    """
+    st = db_runtime_stats()
+    conn = int(st.get("conn") or 0)
+    cap = int(st.get("pool_cap") or 0)
+    shared = float(st.get("shared_mb") or 0)
+    per = float(st.get("backend_mb") or 0)
+    used = round(shared + conn * per, 1)
+    limit = float(os.environ.get("DB_MEM_LIMIT_MB", "820"))
+    ok = (not st.get("error")) and conn <= cap + 2 and used <= limit
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={
+            "ok": ok,
+            "status": "MEMORY_OK" if ok else "MEMORY_HIGH",
+            "used_mb": used,
+            "limit_mb": limit,
+            "db": st,
+        },
+    )
 
 
 @app.get("/api-status")

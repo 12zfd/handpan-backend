@@ -11,7 +11,7 @@ import os
 import socket
 from pathlib import Path
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
@@ -197,6 +197,61 @@ def fallback_to_sqlite(reason: str = "") -> bool:
     logging.getLogger("handpan.db").warning(
         "已降级到本地 SQLite (%s)：%s", SQLITE_PATH, reason)
     return True
+
+
+def _pg_size_to_mb(v: str | None) -> float:
+    """把 PG 的 '189MB' / '2048kB' / '1073741824' 统一换算成 MB。"""
+    s = (v or "").strip().upper()
+    try:
+        if s.endswith("MB"):
+            return float(s[:-2])
+        if s.endswith("KB"):
+            return float(s[:-2]) / 1024.0
+        if s.endswith("GB"):
+            return float(s[:-2]) * 1024.0
+        return float(s) / (1024.0 * 1024.0)      # 裸数字按字节
+    except ValueError:
+        return 0.0
+
+
+def db_runtime_stats() -> dict:
+    """PG 侧运行时指标（连接数 / 内存），供监控与告警使用。
+
+    为什么不能只看连接池：池里的数字是「我们自己以为开了几条」，
+    pg_stat_activity 才是 PG 视角的真相 —— 池外残留连接、Render 多副本
+    各开各的池，只有它能一眼看穿。
+
+    内存同理：shared_buffers 是 Aiven 按套餐定的（实测 189MB，Free 1GB 机器），
+    每条 backend 连接再叠加自己的私有内存 —— **连接数就是内存的主要放大器**，
+    所以把连接数钉死在 5 条，比调任何内存参数都管用。
+
+    ⚠️ backend_mb 是「当前这条连接」的私有内存
+    （pg_backend_memory_contexts 只能看当前会话，PG 没有跨 backend 求和的视图），
+    因此用它 × 连接数做**估算**。SQLite 降级态没有这些指标，返回 {}。
+    """
+    if _state["sqlite"]:
+        return {}
+    out: dict = {}
+    try:
+        with engine.connect() as conn:
+            out["conn"] = int(conn.execute(
+                text("SELECT count(*) FROM pg_stat_activity "
+                     "WHERE application_name = 'handpan-backend'")
+            ).scalar() or 0)
+            out["conn_limit"] = int(conn.execute(text("SHOW max_connections")).scalar() or 0)
+            out["shared_mb"] = _pg_size_to_mb(conn.execute(text("SHOW shared_buffers")).scalar())
+            out["work_mem_mb"] = _pg_size_to_mb(conn.execute(text("SHOW work_mem")).scalar())
+            try:
+                out["backend_mb"] = round(int(conn.execute(
+                    text("SELECT coalesce(sum(total_bytes),0) FROM pg_backend_memory_contexts")
+                ).scalar() or 0) / 1048576.0, 1)
+            except Exception:  # noqa: BLE001
+                out["backend_mb"] = None
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)[:160]
+    p = pool_stats()
+    out["pool_cap"] = (p.get("pool_size") or 0) + (p.get("max_overflow") or 0)
+    return out
 
 
 def dispose_engine() -> None:
