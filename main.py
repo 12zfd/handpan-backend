@@ -43,7 +43,7 @@ from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
-from database import get_db, init_db, pool_stats
+from database import dispose_engine, get_db, init_db, pool_stats
 from database import SQLITE_PATH, db_backend, db_last_error, fallback_to_sqlite, is_fallback
 from models import Score, User
 from pipeline import render_only, run_pipeline
@@ -146,6 +146,18 @@ def _startup() -> None:
             log.warning("已降级到 SQLite: %s", SQLITE_PATH)
         else:
             log.error("降级失败，服务将在每次请求时重试")
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    # 应用关闭前彻底释放连接池：把池里所有连接关掉，不留给进程退出慢慢回收。
+    # Render 每次发版 / 重启都会走到这里；池里残留的连接会白占 Aiven 的
+    # max_connections（免费版只有 20 条），也可能把 idle in transaction 状态
+    # 带到下一次启动。
+    log = logging.getLogger("handpan.shutdown")
+    log.info("关闭数据库连接池: %s", pool_stats())
+    dispose_engine()
+    log.info("数据库连接池已释放")
 
 
 @app.middleware("http")

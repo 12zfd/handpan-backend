@@ -56,12 +56,30 @@ def _normalize(url: str) -> str:
     return url
 
 
+def _sqlite_engine(url: str):
+    """SQLite 引擎（本地开发 / Postgres 不可用时的降级目标）。
+
+    同样把池子限死：SQLAlchemy 默认 QueuePool 是 (5, 10) = 最多 15 条连接，
+    与主库的 (3, 2) 口径不一致，/healthz 上的监控数字会失真。
+    """
+    return create_engine(
+        url,
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=int(os.environ.get("DB_POOL_SIZE", "3")),
+        max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "1800")),
+        pool_timeout=int(os.environ.get("DB_POOL_TIMEOUT", "10")),
+    )
+
+
 DATABASE_URL = _normalize(
     os.environ.get("DATABASE_URL") or f"sqlite:///{(DATA_DIR / 'handpan.db').as_posix()}"
 )
 
 if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    engine = _sqlite_engine(DATABASE_URL)
 else:
     # ── PostgreSQL 连接策略（生产库 Aiven Free：1 CPU / 1 GB RAM / max_connections=20）──
     #
@@ -69,28 +87,32 @@ else:
     # CU-hours —— 池里留一条空闲连接就会让 compute 24h 常驻、4 天烧光额度，
     # 所以当时刻意改成 NullPool（连接用完即关）。
     #
-    # 现在生产库是 **Aiven Free**（固定规格，不按连接存活计费），改为可配置：
-    #   · 默认 QueuePool(pool_size=5, max_overflow=2)：复用连接，省掉每次 TLS 握手；
-    #   · DB_POOL_MODE=nullpool：一键回退「用完即关」。Aiven Free 的
-    #     max_connections 只有 20 且 Aiven 自身运维还要占用若干条，一旦改成多
-    #     worker / 多副本，池连接会成倍放大；遇到连接数或内存告警时，
+    # 现在生产库是 **Aiven Free**（固定规格：1 CPU / 1 GB RAM / max_connections=20），
+    # 改为可配置的固定上限连接池：
+    #   · 默认 QueuePool(pool_size=3, max_overflow=2) → 峰值同时最多 **5 条**连接。
+    #     Aiven Free 的 max_connections 只有 20，且 Aiven 自身运维还要占用若干条；
+    #     后端若多副本 / 多 worker 部署，池连接会成倍放大（副本数 × 5）。
+    #     本项目是「两人内部工具」，5 条连接绰绰有余，内存占用也可控。
+    #   · DB_POOL_MODE=nullpool：一键回退「用完即关」。遇到连接数或内存告警时，
     #     **改一个环境变量即可恢复，不用改代码、不用重新发版**。
     #     见 aiven.io/docs/products/postgresql/reference/pg-connection-limits
     #
-    # 池化三件套（防「僵死连接」与「请求无限等连接」）：
-    #   pool_pre_ping=True —— 取连接前先探活，断线自动重连（Aiven/中间件会静默断空闲连接）
-    #   pool_recycle=280   —— 连接活过 280s 主动换掉，早于常见 300s 空闲断线
+    # 池化四件套（防「僵死连接」「连接老化」「请求无限等连接」「idle 事务占位」）：
+    #   pool_pre_ping=True —— 取连接前先探活，断线自动重连。Aiven Free 空闲会断电、
+    #     中间件也会静默断空闲连接，探活把「拿到手才发现是死的」这两种都提前挡掉
+    #   pool_recycle=1800  —— 连接活过 30 分钟主动换掉，防止连接老化
     #   pool_timeout=10    —— 池空时最多等 10s，超时报错而不是把请求挂死
+    #   探活后立刻 rollback —— 见 get_db() 注释，避免 idle in transaction 占位
     _mode = os.environ.get("DB_POOL_MODE", "queue").strip().lower()
     if _mode == "nullpool":
         _kwargs: dict = dict(poolclass=NullPool)
     else:
         _kwargs = dict(
             poolclass=QueuePool,
-            pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+            pool_size=int(os.environ.get("DB_POOL_SIZE", "3")),
             max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "2")),
             pool_pre_ping=True,
-            pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "280")),
+            pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "1800")),
             pool_timeout=int(os.environ.get("DB_POOL_TIMEOUT", "10")),
         )
 
@@ -162,7 +184,7 @@ def fallback_to_sqlite(reason: str = "") -> bool:
     except Exception:  # noqa: BLE001
         pass
     url = f"sqlite:///{SQLITE_PATH.as_posix()}"
-    engine = create_engine(url, connect_args={"check_same_thread": False})
+    engine = _sqlite_engine(url)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     _state["sqlite"] = True
     _state["fallback"] = True
@@ -177,29 +199,59 @@ def fallback_to_sqlite(reason: str = "") -> bool:
     return True
 
 
-def pool_stats() -> dict:
-    """连接池当前状态，供 /healthz 观察「连接是否泄漏」。
+def dispose_engine() -> None:
+    """彻底释放连接池（应用关闭时调用）。
 
-    checkedout 长期接近 pool_size+max_overflow，就说明有请求没归还连接。
-    NullPool 没有这些方法，返回 mode 即可。
+    ⚠️ 必须读模块级的全局 engine：fallback_to_sqlite() 会**替换**全局 engine，
+    若在此之前把 engine 引用缓存下来，降级后 dispose 到的就是旧引擎，
+    新池的连接不会被释放。
+    """
+    try:
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("handpan.db").warning("engine.dispose 失败: %s", exc)
+
+
+def pool_stats() -> dict:
+    """连接池状态，供 /healthz 观察「是否泄漏 / 是否逼近上限」。
+
+    ⚠️ 字段口径别混用：
+      mode         池类型（QueuePool / NullPool）
+      pool_size    **配置**的常驻连接数上限
+      max_overflow **配置**的临时溢出连接数上限
+                   → 连接硬上限 = pool_size + max_overflow
+      open         当前**实际打开**的连接总数（checkedin + checkedout）
+      checkedout   正在被请求占用。长期贴近硬上限 = 有连接没归还（泄漏）
+      checkedin    池中空闲可复用
+    NullPool 没有这些属性，只返回 mode。
     """
     p = engine.pool
-    out = {"mode": type(p).__name__}
+    out: dict = {"mode": type(p).__name__}
+    # SQLAlchemy 2.x：配置上限在 pool._pool.maxsize（底层 LifoQueue 容量）；
+    # 1.x 是 pool._pool_size。两个路径都兼容，免得升级/降级后监控数字消失。
+    _ps = getattr(p, "_pool_size", None)
+    if not isinstance(_ps, (int, float)):
+        _ps = getattr(getattr(p, "_pool", None), "maxsize", None)
+    if isinstance(_ps, (int, float)):
+        out["pool_size"] = _ps
+    _mo = getattr(p, "_max_overflow", None)
+    if isinstance(_mo, (int, float)):
+        out["max_overflow"] = _mo
+    fn = getattr(p, "size", None)
+    if callable(fn):
+        try:
+            out["open"] = fn()                 # 当前实际打开的连接数
+        except Exception:  # noqa: BLE001
+            pass
     fn = getattr(p, "checkedout", None)
     if callable(fn):
         try:
-            out["checkedout"] = fn()          # 正在被请求占用的连接数
+            out["checkedout"] = fn()
         except Exception:  # noqa: BLE001
             pass
     ci = getattr(p, "checkedin", None)          # QueuePool 上是 property，不是方法
     if isinstance(ci, (int, float)):
-        out["checkedin"] = ci                  # 池中空闲可复用的连接数
-    fn = getattr(p, "size", None)
-    if callable(fn):
-        try:
-            out["pool_size"] = fn()            # 配置的池大小（非当前实际连接数）
-        except Exception:  # noqa: BLE001
-            pass
+        out["checkedin"] = ci
     return out
 
 
