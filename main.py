@@ -763,6 +763,35 @@ def original_file(
     raise HTTPException(status.HTTP_404_NOT_FOUND, "原文件已丢失")
 
 
+def _watchdog_state(st: dict, db_ok: bool) -> dict:
+    """内存 / 连接看门狗判定。/healthz?deep=1 与 /healthz/watch 共用同一套逻辑。
+
+    返回 ok=False 时调用方应回 **503** —— 现有的 UptimeRobot 监控
+    （GET /healthz?deep=1，成功响应码 2xx/3xx）会立刻判定为 DOWN 并发邮件告警。
+    之前这个端点数据库挂了也返 200，等于「只保活、不报警」。
+
+    used_mb 是**估算**：shared_buffers + 本应用连接数 × 单连接私有内存。
+    它覆盖不到 OS page cache 与 PG 后台进程，所以阈值给得宽（默认 820MB
+    ≈ 1GB 容器的 80%）；真正的兜底仍然是「连接数钉死 5 条」。
+    """
+    conn = int(st.get("conn") or 0)
+    cap = int(st.get("pool_cap") or 0)
+    shared = float(st.get("shared_mb") or 0)
+    per = float(st.get("backend_mb") or 0)
+    used = round(shared + conn * per, 1)
+    limit = float(os.environ.get("DB_MEM_LIMIT_MB", "820"))
+    if not db_ok:
+        return {"ok": False, "status": "DB_UNAVAILABLE", "used_mb": used,
+                "limit_mb": limit, "metric_state": "unknown"}
+    if st.get("error") or not st:
+        # PG 可达但统计查询取不到 → 不误报，只标记指标未知
+        return {"ok": True, "status": "MEMORY_OK", "used_mb": used,
+                "limit_mb": limit, "metric_state": "unknown"}
+    ok = conn <= cap + 2 and used <= limit
+    return {"ok": ok, "status": "MEMORY_OK" if ok else "MEMORY_HIGH",
+            "used_mb": used, "limit_mb": limit, "metric_state": "ok"}
+
+
 @app.get("/healthz")
 def healthz(deep: int = Query(default=0, ge=0, le=1)):
     """存活探针。deep=1 时额外做一次真实数据库查询。
@@ -804,6 +833,13 @@ def healthz(deep: int = Query(default=0, ge=0, le=1)):
             out["error"] = str(exc)[:200]
         # PG 侧运行时指标：连接数 / 内存。OOM 类问题的第一现场都在这里。
         out["db_runtime"] = db_runtime_stats()
+        w = _watchdog_state(out["db_runtime"], db_ok=(out.get("db") == "ok"))
+        out["status"] = w["status"]
+        out["mem"] = w
+        if not w["ok"]:
+            # 回 503 —— UptimeRobot 会据此判定 DOWN 并告警
+            out["ok"] = False
+            return JSONResponse(status_code=503, content=out)
     return out
 
 
@@ -819,20 +855,26 @@ def healthz_watch():
     = 1GB 容器的 80%）；真正的兜底仍然是「连接数钉死 5 条」。
     """
     st = db_runtime_stats()
-    conn = int(st.get("conn") or 0)
-    cap = int(st.get("pool_cap") or 0)
-    shared = float(st.get("shared_mb") or 0)
-    per = float(st.get("backend_mb") or 0)
-    used = round(shared + conn * per, 1)
-    limit = float(os.environ.get("DB_MEM_LIMIT_MB", "820"))
-    ok = (not st.get("error")) and conn <= cap + 2 and used <= limit
+    db_ok = False
+    try:
+        db = next(get_db())
+        try:
+            db.execute(select(1)).scalar()
+            db_ok = True
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        st = dict(st)
+        st["error"] = str(exc)[:160]
+    w = _watchdog_state(st, db_ok)
     return JSONResponse(
-        status_code=200 if ok else 503,
+        status_code=200 if w["ok"] else 503,
         content={
-            "ok": ok,
-            "status": "MEMORY_OK" if ok else "MEMORY_HIGH",
-            "used_mb": used,
-            "limit_mb": limit,
+            "ok": w["ok"],
+            "status": w["status"],
+            "used_mb": w["used_mb"],
+            "limit_mb": w["limit_mb"],
+            "metric_state": w["metric_state"],
             "db": st,
         },
     )
