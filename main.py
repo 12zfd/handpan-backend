@@ -68,6 +68,14 @@ app = FastAPI(title="Handpan Sheet Forge", version="1.1.1")
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
 
+# 允许「本地双击打开 HTML」的形态：file:// 页面发起的请求，浏览器发的 Origin 头
+# 是字面量 "null"（不是任何真实站点）。没有这条，双击 index.html 时前端
+# 拿不到任何接口响应（连 /login 都过不去），表现为"双击就报错"。
+# 风险评估：接口靠 Authorization: Bearer 头里的 JWT 鉴权，不依赖 Cookie，
+# 别人的页面拿不到我们的 token，因此放开 "null" 不会导致越权读写用户数据。
+if "null" not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.append("null")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
